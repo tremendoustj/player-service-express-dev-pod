@@ -3,13 +3,16 @@
 Assessment date: 2026-11-02.
 
 **Status: shared data access, bounded search/filter, population statistics,
-numeric rankings, and comparisons implemented; Express API pending.** Player/country lookups are
+numeric rankings, comparisons, and opt-in SQLite deadlines implemented;
+Express API pending.** Player/country lookups are
 parameterized, reads explicitly close their read-only SQLite connections, and
 missing-player handling has regression coverage. Internal search supports validated filters and
 deterministic pagination; statistics reuse those filters and explicitly report
 missing values and omitted groups. Rankings reuse the filters and pagination,
 with deterministic ties and explicit null exclusions. Comparisons preserve
 requested player order, report pairwise numeric differences, and reject missing IDs.
+All shared reads can opt into a monotonic execution budget and bounded lock waits;
+legacy calls retain their existing timeout defaults.
 No integration endpoints, authentication, observability, or MCP server are
 implemented yet. No infrastructure was deployed
 and no Nexla resources were created. This document distinguishes the existing
@@ -36,7 +39,8 @@ and countries as SQL parameters and explicitly closes each read-only connection.
 The initial assessment found interpolated lookups and unclosed connections; the
 safe shared data-access increment below addresses those prerequisites.
 There is still no application authentication, validation layer, request correlation,
-structured logging, operational metrics, or explicit request/query deadline.
+structured logging, operational metrics, or HTTP request deadline. Shared service
+reads now support optional SQLite deadlines, but legacy routes do not enable them.
 The development entry point binds port 8000 on all interfaces with debug enabled.
 Live Ollama requests remain unverified; the missing-player error path now has
 local Flask test-client coverage.
@@ -225,10 +229,10 @@ Nexla connector or Express chat test.
 
 Filtered population statistics, rankings, and comparisons are implemented in
 increments 4 through 6 below. Integration authentication,
-HTTP validation/OpenAPI, execution deadlines, observability, and production
-packaging remain future increments. The current search limits bound inputs and
-result sizes, **not query duration**; do not expose this service directly as an
-unauthenticated integration.
+HTTP validation/OpenAPI, observability, and production packaging remain future
+increments. The search limits bound inputs and result sizes, **not query duration**;
+opt-in database execution deadlines are implemented in increment 7 below.
+Do not expose this service directly as an unauthenticated integration.
 
 ### Filtered population statistics (increment 4)
 
@@ -426,7 +430,7 @@ Connections close on success and on query, missing-ID, duplicate-ID, numeric
 validation, or overflow failure. Storage errors propagate instead of becoming
 empty successful results.
 
-The complete local suite now has **444 passing tests**. Comparison coverage
+At the end of increment 6, the local suite had **444 passing tests**. Comparison coverage
 includes exact cardinality/ID boundaries, input order and case, every pair,
 all-null and empty populations, missing-ID details, zeros/fractions, numeric
 overflow, bounded duplicate detection, concurrent snapshot consistency, and
@@ -435,10 +439,89 @@ against independent CSV expectations, including missing values. The legacy Flask
 search, statistics, and complete ranking-pagination tests still pass. These are
 local SQLite/Flask results, not Express/Nexla, MCP, Docker, or live Ollama validation.
 
-HTTP routes, authentication, execution deadlines, observability, production
+HTTP routes, authentication, observability, production
 packaging, and Express/Nexla validation remain future increments. Comparison
-cardinality limits bound result size, not query duration. No new environment
-variables or dependencies were added, and no integration was exposed or published.
+cardinality limits bound result size, not query duration; optional database
+deadlines are implemented in increment 7 below. Increment 6 added no environment
+variables or dependencies and did not expose or publish an integration.
+
+### Cancellable SQLite reads (increment 7)
+
+`PlayerService` now accepts two optional, keyword-only timeout arguments. These
+are internal Python configuration, **not environment variables or tool inputs**:
+
+```python
+service = PlayerService(
+    "/absolute/path/to/player.db",
+    busy_timeout_seconds=1,
+    query_timeout_seconds=2,
+)
+page = service.search_players(limit=20)
+```
+
+| Argument | Contract |
+| --- | --- |
+| `busy_timeout_seconds` | Finite integer/float from 0 through 60. Zero disables waiting on a database lock. Default 5 preserves SQLite's previous default. |
+| `query_timeout_seconds` | `None` (the legacy default, no execution deadline), or a finite integer/float from 0.001 through 60 seconds. |
+
+Booleans, strings, nonfinite values, and out-of-range values are rejected with
+`ValueError` before opening a database connection. `busy_timeout_seconds=None`
+is invalid. The integration HTTP layer must explicitly enable the proposed
+1-second busy wait and 2-second query budget; legacy routes remain unchanged.
+
+Each read connection gets its own absolute monotonic deadline, starting before
+the connection is opened. Multi-statement search, ranking, and statistics reads
+share that deadline across their entire read transaction; executing the next
+statement does not reset the budget. The constructor's schema read is also
+bounded, but has a separate budget from subsequent calls. Service instances
+can be reused: neither idle time nor a previous timeout consumes a later call's
+budget.
+
+SQLite's progress handler checks the deadline every 1,000 virtual-machine
+instructions, including while fetching rows. Explicit checks before statements
+and before completing the read reject expired results even when a short query
+never reaches a progress checkpoint. Each statement's lock wait is capped at
+the smaller of the configured busy timeout and the remaining read budget,
+rounded down to SQLite's integer milliseconds. This matters because a progress
+handler does not interrupt SQLite's busy wait, and SQLite restarts that wait
+for each statement.
+
+Deadline checks and progress-handler cancellations raise
+`PlayerQueryTimeoutError`, a `TimeoutError` with the safe message
+`Player database read deadline exceeded`. The original SQLite interruption is
+retained as the exception cause, not returned as a successful empty result.
+Lock-wait exhaustion remains a SQLite storage error, including when its wait
+was shortened by the deadline; it must not be mistaken for an empty population.
+Other storage/data errors retain their original types rather than being
+relabeled solely because time elapsed. The future HTTP layer should map
+deadline errors to 504 and unavailable/locked storage to 503 with sanitized
+envelopes.
+
+Progress handlers are removed and connections closed on success, query failure,
+or cancellation. Closing an interrupted read transaction releases its locks;
+subsequent reads can succeed. Read-only mode, query-only enforcement, snapshot
+consistency, and existing response shapes are preserved.
+
+These are **cooperative database-read deadlines, not hard HTTP wall-clock
+limits**. SQLite progress callbacks cannot interrupt a blocked filesystem call
+or arbitrary Python work. Conversion after the read context and HTTP response
+serialization are outside this budget. Production ingress/WSGI request limits
+remain necessary; no cancellation thread or long-running process is introduced.
+
+The complete local suite now has **527 passing tests**. New coverage checks
+strict configuration bounds, unchanged legacy defaults, every shared read
+operation, schema/setup time, cumulative multi-statement budgets, decreasing
+busy waits, short-query expiry, failure cleanup, and fresh budgets after prior
+calls. Real SQLite tests interrupt CPU-heavy execution and row fetching, cancel
+an expensive search transaction, verify an exclusive writer can proceed after
+cancellation, and bound actual lock contention. Full-seed reads using the
+proposed integration budgets match the legacy service results over all
+**19,370 players**. This is local SQLite/Flask validation, not Express/Nexla,
+MCP, Docker, or live Ollama validation.
+
+No HTTP routes, environment settings, authentication, or publication were added.
+The next integration increment must wire the service's validated operations,
+timeouts, and typed errors into the opt-in authenticated API and its schema.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -563,10 +646,11 @@ Only fixed, allowlisted columns/operations may participate in queries.
   Explicitly close connections; integration reads use SQLite read-only mode and
   query-only enforcement. A missing database must fail clearly, not create an
   empty database during a tool call.
-- Proposed limits: 1-second SQLite busy wait and 2-second query execution budget,
-  enforced with a monotonic deadline/progress handler. A connection timeout alone
-  does **not** limit query execution. Bound request size and comparison cardinality.
-  Verify cancellation releases resources.
+- The service now supports bounded busy waits and monotonic query deadlines
+  (increment 7). The future integration must opt into the proposed 1-second
+  busy wait and 2-second read budget; legacy defaults are unchanged. A connection
+  timeout alone does **not** limit query execution. Bound request size and
+  comparison cardinality, and retain separate HTTP request limits.
 - If an HTTP MCP adapter is needed, configure one fixed upstream service origin,
   verify TLS, disable redirects, and enforce connect/read plus total execution
   deadlines. Keep separate inbound and upstream credentials; do not pass through
@@ -615,8 +699,8 @@ Proposed configuration names below are **not currently read by the application**
 | `PLAYER_INTEGRATION_ENABLED` | Opt-in integration, false by default. |
 | `PLAYER_INTEGRATION_TOKEN` | Dedicated secret, no default; required when enabled. Document secret-file injection for containers without embedding it in an image. |
 | `PLAYER_DB_PATH` | Operator-controlled database path; default remains the existing application-relative path. Never a tool argument. |
-| `PLAYER_DB_BUSY_TIMEOUT_SECONDS` | Bounded lock wait, proposed default 1. |
-| `PLAYER_QUERY_TIMEOUT_SECONDS` | Execution budget, proposed default 2; reject invalid/nonfinite configuration. |
+| `PLAYER_DB_BUSY_TIMEOUT_SECONDS` | Bounded lock wait, proposed default 1; wire to the service's 0-60 second bound. |
+| `PLAYER_QUERY_TIMEOUT_SECONDS` | Read budget, proposed default 2; wire to the service's 0.001-60 second bound and require a deadline when enabled. |
 
 Add a secret-free environment example and document settings when implementing
 them. Keep page/argument caps in the versioned contract rather than introducing
@@ -635,6 +719,7 @@ or document and validate a deliberate compatibility decision.
 | Filtered population statistics (**complete**) | Full-population numeric summaries and bounded categorical groups reuse shared filters; explicit missing/omitted counts, one read snapshot, finite-output checks, failure cleanup, and independent full-seed expectations. |
 | Bounded numeric rankings (**complete**) | Shared filters and pagination, allowlisted metrics/directions, binary player-ID ties, explicit null exclusions, full-population finite-metric validation, snapshot consistency, failure cleanup, and complete seed traversal in all six metric/direction combinations. |
 | Player comparisons (**complete**) | Ordered comparisons of 2-5 distinct validated IDs; explicit missing/duplicate stored-ID errors; full nullable records and finite pairwise differences from one bounded query snapshot; fixture/seed expectations, concurrency, and cleanup tests. |
+| Cancellable SQLite reads (**complete**) | Validated opt-in query budgets and busy waits; monotonic deadlines shared across read statements; progress cancellation and short-query checks; real CPU/lock contention, transaction cleanup, full-seed compatibility, and unchanged legacy defaults. |
 | Authenticated integration API and schema | Opt-in routes, fail-closed configuration, strict validation, deadlines, safe errors, and OpenAPI contract tests. Flask test-client tests cover all operations, unauthorized calls, malformed inputs, unavailable/locked storage, and unchanged legacy/Ollama routes (Ollama mocked). |
 | Observability | Correlation IDs across success/failure, redacted structured logs, bounded metrics labels, and counter/latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
@@ -695,7 +780,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.

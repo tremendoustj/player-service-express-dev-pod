@@ -115,6 +115,20 @@ def player_db(tmp_path, player_records):
 
 
 @pytest.fixture
+def tracked_connections(monkeypatch, player_db):
+    connections = []
+    connect = sqlite3.connect
+
+    def track_connect(*args, **kwargs):
+        conn = connect(*args, **kwargs)
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", track_connect)
+    return connections
+
+
+@pytest.fixture
 def seed_player_records(player_db):
     with PLAYER_CSV.open(encoding="utf-8-sig", newline="") as csv_file:
         reader = csv.DictReader(csv_file)

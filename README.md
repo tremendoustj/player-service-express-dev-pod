@@ -16,6 +16,8 @@ bounded categorical summaries from a consistent snapshot. Numeric rankings
 support height, weight, and birth year with stable ties, bounded pages, and
 explicit missing-value exclusions. Ordered comparisons support 2-5 distinct IDs,
 null-aware numeric differences, and explicit missing-player errors.
+Shared reads can opt into validated SQLite deadlines and bounded lock waits;
+cancellation closes connections without changing legacy timeout defaults.
 Express-facing endpoints are not implemented yet; existing API response formats
 are unchanged.
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from math import isfinite
 from pathlib import Path
+from time import monotonic
 from typing import Iterator, Optional, Union
 
 from app_paths import PLAYER_DB
@@ -17,11 +18,23 @@ DEFAULT_GROUP_LIMIT = 20
 MAX_GROUP_LIMIT = 100
 MAX_COMPARISON_PLAYERS = 5
 MAX_PLAYER_ID_LENGTH = 32
+DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
+MIN_QUERY_TIMEOUT_SECONDS = 0.001
+MAX_DB_TIMEOUT_SECONDS = 60.0
+_PROGRESS_HANDLER_STEPS = 1000
 
 
 def _validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+
+
+def _validate_timeout(name: str, value: float, minimum: float) -> None:
+    if type(value) not in (int, float) or not minimum <= value <= MAX_DB_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"{name} must be a finite number between "
+            f"{minimum:g} and {MAX_DB_TIMEOUT_SECONDS:g} seconds"
+        )
 
 
 def _pagination(limit: int, offset: int, total: int) -> dict:
@@ -42,6 +55,40 @@ class PlayersNotFoundError(LookupError):
     def __init__(self, missing_ids: tuple[str, ...]) -> None:
         self.missing_ids = missing_ids
         super().__init__("One or more requested player IDs were not found")
+
+
+class PlayerQueryTimeoutError(TimeoutError):
+    def __init__(self) -> None:
+        super().__init__("Player database read deadline exceeded")
+
+
+@dataclass
+class _ReadConnection:
+    connection: sqlite3.Connection
+    busy_timeout_seconds: float
+    deadline: Optional[float]
+    interrupted: bool = False
+
+    def check_deadline(self) -> None:
+        if self.deadline is not None and monotonic() >= self.deadline:
+            raise PlayerQueryTimeoutError()
+
+    def interrupt_if_expired(self) -> int:
+        if self.deadline is not None and monotonic() >= self.deadline:
+            self.interrupted = True
+            return 1
+        return 0
+
+    def execute(self, query: str, parameters: tuple = ()) -> sqlite3.Cursor:
+        if self.deadline is not None:
+            remaining = self.deadline - monotonic()
+            if remaining <= 0:
+                raise PlayerQueryTimeoutError()
+            # SQLite restarts its busy wait per statement; share the read's budget.
+            wait_ms = int(min(self.busy_timeout_seconds, remaining) * 1000)
+            self.connection.execute(f"PRAGMA busy_timeout = {wait_ms}")
+            self.check_deadline()
+        return self.connection.execute(query, parameters)
 
 
 @dataclass(frozen=True)
@@ -87,17 +134,60 @@ class PlayerFilters:
 
 
 class PlayerService:
-    def __init__(self, db_path=None):
+    def __init__(
+        self,
+        db_path=None,
+        *,
+        busy_timeout_seconds: float = DEFAULT_BUSY_TIMEOUT_SECONDS,
+        query_timeout_seconds: Optional[float] = None,
+    ):
+        _validate_timeout("busy_timeout_seconds", busy_timeout_seconds, 0)
+        if query_timeout_seconds is not None:
+            _validate_timeout(
+                "query_timeout_seconds",
+                query_timeout_seconds,
+                MIN_QUERY_TIMEOUT_SECONDS,
+            )
+        self.busy_timeout_seconds = busy_timeout_seconds
+        self.query_timeout_seconds = query_timeout_seconds
         self.db_path = Path(PLAYER_DB if db_path is None else db_path).resolve()
         self.columns = self.get_columns()
 
     @contextmanager
-    def _read_connection(self) -> Iterator[sqlite3.Connection]:
+    def _read_connection(self, *, row_factory=None) -> Iterator[_ReadConnection]:
+        deadline = (
+            monotonic() + self.query_timeout_seconds
+            if self.query_timeout_seconds is not None
+            else None
+        )
+        connect_timeout = (
+            min(self.busy_timeout_seconds, self.query_timeout_seconds)
+            if self.query_timeout_seconds is not None
+            else self.busy_timeout_seconds
+        )
         with closing(
-            sqlite3.connect(f"{self.db_path.as_uri()}?mode=ro", uri=True)
+            sqlite3.connect(
+                f"{self.db_path.as_uri()}?mode=ro", uri=True, timeout=connect_timeout
+            )
         ) as conn:
-            conn.execute("PRAGMA query_only = ON")
-            yield conn
+            reader = _ReadConnection(conn, self.busy_timeout_seconds, deadline)
+            conn.row_factory = row_factory
+            try:
+                if deadline is not None:
+                    conn.set_progress_handler(
+                        reader.interrupt_if_expired, _PROGRESS_HANDLER_STEPS
+                    )
+                reader.execute("PRAGMA query_only = ON")
+                yield reader
+                # Short statements may not reach a progress-handler checkpoint.
+                reader.check_deadline()
+            except sqlite3.OperationalError as exc:
+                if reader.interrupted:
+                    raise PlayerQueryTimeoutError() from exc
+                raise
+            finally:
+                if deadline is not None:
+                    conn.set_progress_handler(None, 0)
 
     def _fetchall(self, query, parameters=()):
         with self._read_connection() as conn:
@@ -249,8 +339,7 @@ class PlayerService:
                 )
             )
 
-        with self._read_connection() as conn:
-            conn.row_factory = sqlite3.Row
+        with self._read_connection(row_factory=sqlite3.Row) as conn:
             # Numeric summaries and all groups must describe the same population.
             conn.execute("BEGIN")
             summary = conn.execute(

@@ -6,20 +6,6 @@ import pytest
 from player_service import PlayersNotFoundError, PlayerService
 
 
-@pytest.fixture
-def tracked_connections(monkeypatch, player_db):
-    connections = []
-    connect = sqlite3.connect
-
-    def track_connect(*args, **kwargs):
-        conn = connect(*args, **kwargs)
-        connections.append(conn)
-        return conn
-
-    monkeypatch.setattr(sqlite3, "connect", track_connect)
-    return connections
-
-
 def assert_connections_closed(connections):
     assert connections
     for conn in connections:
