@@ -5,7 +5,7 @@ Assessment date: 2026-11-02.
 **Status: shared data access, bounded search/filter, population statistics,
 numeric rankings, comparisons, opt-in SQLite deadlines, and authenticated HTTP
 search/details/statistics/rankings/comparisons implemented, with a validated
-OpenAPI 3.1 contract.**
+OpenAPI 3.1 contract and authenticated operational metrics.**
 Player/country lookups are
 parameterized, reads explicitly close their read-only SQLite connections, and
 missing-player handling has regression coverage. Internal search supports validated filters and
@@ -26,7 +26,10 @@ Rankings use required allowlisted metrics, bounded pages, and explicit exclusion
 Comparisons accept 2-5 ordered IDs and return full records and null-aware
 pairwise differences, with an explicit 404 if any selected player is missing.
 [Their configuration and contracts](express-api.md) distinguish
-implemented behavior from the remaining metrics, packaging, and validation work.
+implemented behavior from the remaining production packaging/log-handler and
+validation work. A private, authenticated metrics route now provides bounded
+request/error counters and latency histograms with per-app, single-process
+collection and thread-safe updates.
 The [versioned OpenAPI document](express-openapi.json) is a local contract, not a
 published route or a verified Express import format.
 No MCP server is implemented. No infrastructure was deployed
@@ -56,7 +59,8 @@ safe shared data-access increment below addresses those prerequisites.
 Legacy routes remain unauthenticated and retain their original responses.
 The additive integration endpoints implement
 authentication, validation, request correlation, and structured log messages.
-Operational metrics and production HTTP request limits remain pending. Shared service reads support
+Operational metrics are implemented in increment 14; production HTTP request
+limits and log-handler configuration remain pending. Shared service reads support
 optional SQLite deadlines, enabled for all implemented integration operations but not for legacy routes.
 The development entry point binds port 8000 on all interfaces with debug enabled.
 Live Ollama requests remain unverified; the missing-player error path now has
@@ -787,6 +791,52 @@ network or Express/Nexla validation. Operational metrics, production packaging,
 real HTTP smoke tests, and approval-gated tenant validation remain pending.
 No resources were deployed or published.
 
+### Authenticated operational metrics (increment 14)
+
+[`express_metrics.py`](../player-service-app/express_metrics.py) now owns an
+isolated Prometheus registry for each enabled Flask app.
+`GET /integrations/express/v1/metrics` exports request/error counters and a
+latency histogram through the existing authenticated boundary, without database
+or Ollama access. The same integration token is required; unknown query inputs
+and request bodies are rejected, and correlation/cache headers and sanitized
+JSON errors are preserved. Scrape failures are logged and counted.
+
+Metrics cover all five reads, authentication/validation/routing failures,
+storage errors, timeouts, and HEAD/OPTIONS. Operation and error-code labels are
+allowlisted; status labels are bounded HTTP codes. No caller-supplied path,
+method, query, credential, player ID, request ID, or exception text is a label.
+Latency reuses the request log's monotonic measurement, expressed in seconds.
+Scrapes are counted after rendering and appear in the next scrape.
+
+The [metrics guide](express-api.md#operational-metrics) defines names, labels,
+histogram buckets, scrape semantics, ingress restrictions, and collection limits.
+The metrics route is **not a player tool** and remains outside the five-operation
+OpenAPI contract. It must not be externally exposed or bound in Express/Nexla.
+The shared token is not a separate operator authorization scope; private ingress
+and scrape routing remain required.
+
+The runtime pins `prometheus-client==0.26.0` (Python >= 3.9) and uses thread-safe,
+in-memory **single-process** collection. Each app has independent counters,
+reset on replacement, without registering in the global collector registry.
+One WSGI worker with threads per independently scraped instance is the supported
+deployment model. Multi-worker aggregation is not automatic: the
+[official multi-process requirements](https://prometheus.github.io/client_python/multiprocess/)
+include different collectors, a managed directory lifecycle, and worker hooks.
+This implementation rejects either multi-process environment-variable spelling,
+even if empty, before database initialization when enabled. It cannot infer an
+external server's worker count; production packaging must set and test it.
+Disabled integration behavior and legacy player/Ollama routes remain unchanged.
+
+The complete local suite has **1524 passing tests**, including **74 metrics
+tests** and the extended disabled-route/OpenAPI exclusions. Coverage verifies
+all five read success/failure paths, exact histogram bounds and seconds, real
+SQLite lock/deadline failures and recovery, sanitized scrape errors, no database
+access for scraping, bounded/redacted labels, independent app registries,
+concurrent updates and Flask request IDs, and fail-closed unsupported mode
+configuration. No processes, monitoring services, or platform resources were
+deployed. Production logging/container configuration, real loopback HTTP smoke
+tests, and approval-gated tenant validation remain pending.
+
 ## 2. Verified Express.dev / Nexla mechanisms
 
 The following are supported by official documentation retrieved on the assessment
@@ -939,11 +989,14 @@ timestamp, operation/route template, status, duration, request ID, and result
 count. Do not log authorization values, raw query/body data, player records,
 SQL text, or user-controlled strings as unescaped log fields.
 
-Add request/error/auth-failure/timeout counters and a latency histogram with
-bounded operation/status labels. Protect the metrics surface and keep health
-responses free of configuration details. Do not label metrics with player IDs,
-request IDs, or search text. Verify the metrics deployment mode matches the
-chosen WSGI worker model.
+Request/error counters (including auth failures and timeouts) and a latency
+histogram are implemented with bounded labels, as described in
+[increment 14](#authenticated-operational-metrics-increment-14). Keep the
+authenticated metrics surface private and exclude it from generated tools and
+public ingress. Do not label metrics with player IDs, request IDs, or search text.
+Production packaging must verify one threaded WSGI worker per scrape target;
+multi-process aggregation is not implemented. Production log-handler and access
+log redaction configuration remain pending.
 
 Capture Nexla receipt IDs during external validation alongside application
 request IDs. Whether Nexla forwards correlation headers/trace IDs is a tenant
@@ -969,6 +1022,7 @@ for exact validation and scope):
 | `PLAYER_DB_PATH` | **Pending:** operator-controlled database path; default remains the existing application-relative path. Never a tool argument. |
 | `PLAYER_DB_BUSY_TIMEOUT_SECONDS` | **Implemented:** integration-only bounded lock wait, default 1, range 0-60 seconds. |
 | `PLAYER_QUERY_TIMEOUT_SECONDS` | **Implemented:** integration-only per-read budget, default 2, range 0.001-60 seconds; cannot be disabled when enabled. |
+| `PROMETHEUS_MULTIPROC_DIR`, `prometheus_multiproc_dir` | **Unsupported:** both must be unset when the integration is enabled; even an empty value fails before DB initialization. Metrics require one worker process per scrape target. |
 
 A secret-free environment example and implemented settings are documented in
 increment 8; extend them when adding packaging settings.
@@ -995,8 +1049,9 @@ or document and validate a deliberate compatibility decision.
 | Authenticated numeric-ranking HTTP (**complete**) | Shared enum/filter/page validation before database access, bounded pages with stable ties and explicit exclusions, safe errors/serialization, configured deadlines, redacted logs, and complete HTTP seed pagination in all six metric/direction combinations against independent CSV expectations. |
 | Authenticated player-comparison HTTP (**complete**) | Shared cardinality/ID/uniqueness validation before database access, one ordered comma-separated ID parameter, bounded read and pairwise output, safe missing/duplicate/overflow errors, configured deadlines, redacted logs, and independent fixture/seed expectations. |
 | Integration API schema (**complete**) | Versioned OpenAPI 3.1 contract for all five operations; standards validation, route/parameter drift checks, list serialization, nullable output, malformed inputs, unavailable/locked storage, missing records, and full-seed schema coverage, without changing legacy routes. |
-| Operational observability | Extend the implemented correlation IDs/redacted request log messages with production logging configuration, bounded metrics labels, counters, and latency tests. Include timeout/error paths, not just happy paths. |
-| Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
+| Operational metrics (**complete**) | Authenticated private scrape route, isolated per-app registries, bounded labels, request/error/auth-failure/timeout counters, latency histogram boundaries, real lock/deadline recovery, concurrent updates, and disabled/unsupported-mode checks. Keep metrics out of the player-tool OpenAPI contract. |
+| Production logging | Configure handlers to retain structured INFO request logs; disable/redact web-server and proxy access logs so raw URIs and credentials are not emitted. Verify in the production WSGI entry point. |
+| Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, read-only mounts, and one threaded worker per metrics scrape target. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
 | Express/Nexla validation | Operator-approved, authenticated Studio/connector setup; review generated contracts and call every capability, inspect receipts, and compare with local expected results. If a custom MCP adapter is necessary, add and verify it before claiming this gate. Otherwise document exact outstanding external blockers. |
 
 Every implementation increment must update the relevant documentation and run
@@ -1054,7 +1109,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10/11/12/13 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10/11/12/13/14 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.

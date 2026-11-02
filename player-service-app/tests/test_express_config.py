@@ -146,7 +146,7 @@ def test_bad_configuration_fails_before_database_initialization(
     "path",
     [
         "/players", "/players/aaronha01", "/statistics", "/rankings?metric=height",
-        "/comparisons?player_ids=aaronha01,aaronto01",
+        "/comparisons?player_ids=aaronha01,aaronto01", "/metrics",
     ],
 )
 def test_default_app_has_no_integration_routes_or_headers(client, path):
@@ -157,6 +157,7 @@ def test_default_app_has_no_integration_routes_or_headers(client, path):
     assert all(
         not rule.rule.startswith(API_PREFIX) for rule in client.application.url_map.iter_rules()
     )
+    assert "express_metrics" not in client.application.extensions
 
 
 def test_settings_are_captured_per_application(

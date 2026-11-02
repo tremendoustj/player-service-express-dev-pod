@@ -2,9 +2,9 @@
 
 **Status: all five opt-in read operations (search/filter, player details,
 population statistics, numeric rankings, and comparisons) are implemented and
-locally tested, with a validated OpenAPI 3.1 contract.**
-Metrics, production packaging, real loopback HTTP smoke tests, and authenticated
-Express/Nexla validation remain pending.
+locally tested, with a validated OpenAPI 3.1 contract and authenticated operational
+metrics.** Production packaging/log-handler configuration, real loopback HTTP
+smoke tests, and authenticated Express/Nexla validation remain pending.
 
 The [architecture assessment](express-integration-architecture.md) records the
 verified platform mechanisms, integration decision, remaining acceptance gates,
@@ -18,7 +18,9 @@ document for API contract version **1.0.0**. It contains exactly the five
 implemented GET operations, their stable operation IDs, bearer security,
 parameter bounds/defaults/enums, full nullable response schemas, error envelopes,
 and correlation/cache headers. It excludes legacy routes, Ollama, mutations,
-arbitrary SQL, and any unimplemented metrics or MCP endpoints.
+arbitrary SQL, and MCP endpoints.
+The implemented private metrics route is deliberately excluded: it is an
+operator scrape surface, not a player tool.
 
 This is a repository artifact, **not an additional HTTP route**, deployed
 service, or verified Express/Nexla import mechanism. Its relative server URL `/`
@@ -45,7 +47,7 @@ Important binding details:
 Standards validation and response-schema checks run locally without tenant
 credentials or external schema references. Test-only validators live in
 [`requirements-test.txt`](../player-service-app/requirements-test.txt); the
-runtime dependency manifest and application behavior are unchanged.
+validators are not runtime dependencies.
 
 ## Configuration
 
@@ -64,6 +66,11 @@ a safe `ValueError` **before database initialization**.
 When disabled, no integration blueprint or hooks are installed, and unused token
 and timeout settings are ignored. Integration URLs return the application's
 normal 404 response. Legacy `/v1/*` behavior and timeout defaults remain unchanged.
+No integration metrics registry is created while disabled. When enabled,
+`PROMETHEUS_MULTIPROC_DIR` and its legacy lowercase spelling
+`prometheus_multiproc_dir` must both be **unset**: even an empty value fails
+startup before database initialization. Multi-process collection is unsupported;
+see [operational metrics](#operational-metrics) for the required worker model.
 
 [`player-service-app/.env.example`](../player-service-app/.env.example) contains
 no credential. It is a reference, **not an automatically loaded configuration
@@ -470,11 +477,83 @@ Tokens, request/query/body contents,
 player records, SQL, and exception messages/tracebacks are excluded. Successes
 use INFO and failures use WARNING
 on Flask's application logger; configure logging to retain INFO when deploying.
-Production log-handler formatting and operational metrics are still pending.
+Production log-handler formatting remains pending; operational metrics are
+implemented below.
 Web server/proxy access logs are separate and may include raw URIs; disable or
 redact those logs before production exposure. The application log tests do not
 validate those server logs. No application rate limiter or per-user authorization
 model is claimed.
+
+## Operational metrics
+
+`GET /integrations/express/v1/metrics` exports **Prometheus text**, not a JSON
+player response. It is installed only when the integration is enabled and uses
+the **same bearer token** as the player operations. Authentication precedes
+validation; no query parameters are supported, and the shared query-size/body
+restrictions, HEAD/OPTIONS authentication, sanitized JSON errors, correlation,
+and no-store headers apply. Successful scrapes carry `X-Request-ID` only in the
+header, never in a metric label or response envelope.
+
+**Keep this endpoint private.** The token grants access to both player reads and
+metrics; it does not provide a separate operator privilege. Approved ingress
+must allowlist only the five player routes for Nexla and deny the metrics route
+externally, rather than expose the entire integration prefix. Do not register
+metrics as an Express tool, connector source, or MCP operation. The player
+OpenAPI contract deliberately omits it.
+
+With the local-only server and token available as described above:
+
+```shell
+printf 'Authorization: Bearer %s\n' "$PLAYER_INTEGRATION_TOKEN" |
+  curl --silent --show-error --fail-with-body --header @- \
+    'http://127.0.0.1:8000/integrations/express/v1/metrics'
+```
+
+The pinned `prometheus-client==0.26.0` runtime dependency supports Python 3.9+.
+Each Flask app owns a separate registry containing only these metric families;
+default Python/process collectors are not exported:
+
+| Metric | Labels and meaning |
+| --- | --- |
+| `player_service_express_requests_total` | `operation`, `status`; one count per integration response, including failures, HEAD/OPTIONS, routing errors, and metrics scrapes. |
+| `player_service_express_errors_total` | `operation`, `code`; the subset with status >= 400. Authentication failures use `code="unauthorized"`; database deadlines use `code="query_timeout"`. Other codes follow the documented errors above, with `http_error` as the bounded fallback. |
+| `player_service_express_request_duration_seconds` | `operation`; histogram with `_bucket`, `_count`, and `_sum` samples. Uses the same monotonic duration as the request log, in seconds without millisecond rounding. |
+
+Operations are the five fixed `express_integration.<operationId>` values,
+`express_integration.get_metrics`, or `unmatched`. Unknown URLs and unsupported
+methods use `unmatched`, not their raw paths or method strings. Status labels
+are decimal HTTP codes from 100 through 599, or `other`. Error codes are
+allowlisted. Player/request IDs, query text, credentials, exception messages,
+raw routes, and methods never become labels. The client also exports standard
+`_created` samples; label series appear on their first observation.
+
+Latency covers the integration request hook through response preparation,
+including authentication, validation, and serialization. It excludes queueing,
+socket transfer, and later log/response-finalization work, so it is **not an
+end-to-end network latency or hard HTTP timeout**. Inclusive histogram bounds
+are 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, and 120
+seconds, plus `+Inf`.
+
+A scrape renders before its own request is recorded, so that scrape becomes
+visible on the next scrape. A fresh app's first scrape contains metric
+definitions but no samples. Use operation labels to separate scrape traffic
+from player-operation rates and latency. Scraping does not initialize or query
+SQLite or Ollama and still works with unavailable player storage; it is **not
+a database readiness check**. Render failures return a logged, sanitized 500,
+not an empty successful scrape.
+
+Collection is **in-memory, per app and per process**, with thread-safe updates.
+Counters reset when the app/process is replaced. Use **one WSGI worker process
+with threads per independently scraped service instance**. Multiple workers
+behind one scrape target would yield incomplete, changing views; multiple
+replicas must be scraped individually and aggregated by the monitoring system.
+The [Prometheus client's multi-process mode](https://prometheus.github.io/client_python/multiprocess/)
+requires a different registry, directory lifecycle, and worker hooks and is
+deliberately not implemented. Both multi-process environment-variable spellings
+are rejected when the integration is enabled, but the app cannot enforce an
+external server's worker count. Production packaging must set and verify this
+worker model; no multi-worker, container, or deployed monitoring validation is
+claimed.
 
 ## Nexla binding and validation boundary
 
@@ -517,7 +596,7 @@ For an activated `uv` environment without pip, use
 To run only the contract checks, select
 `player-service-app/tests/test_express_openapi.py` instead of the tests directory.
 
-The complete local suite passes **1449 tests**. Coverage includes disabled/invalid
+The complete local suite passes **1524 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
@@ -550,5 +629,10 @@ and locked storage, and rejection of malformed response shapes. Every search
 page across all **19,370 seed players** conforms to the response schema;
 seed statistics, rankings, nullable details, and maximum-size comparisons are
 also schema-checked.
+The 74 metrics tests cover exact histogram boundaries/units, all read-operation
+success/error observations, authentication and validation, real SQLite locks and
+deadlines with recovery, redaction/cardinality, app isolation, thread-safe counts,
+concurrent Flask request IDs, private scrape behavior without database access,
+sanitized scrape failures, and unsupported multi-process configuration.
 Flask test-client coverage is not
 a real network, container, live Ollama, or Express/Nexla end-to-end result.

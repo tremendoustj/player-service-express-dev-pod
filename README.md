@@ -38,7 +38,12 @@ The integration is disabled by default; see the linked configuration and
 local-only setup. The [versioned OpenAPI 3.1 contract](docs/express-openapi.json)
 describes all five operations and is checked against actual Flask responses.
 It is a local API contract, not a verified Express import format or published
-endpoint. Metrics, packaging, and Express/Nexla validation are still pending.
+endpoint. [Authenticated operational metrics](docs/express-api.md#operational-metrics)
+now expose request/error counters and latency histograms at
+`GET /integrations/express/v1/metrics`. Keep this scrape route private and out of
+Express tools; collection supports one worker process with multiple threads,
+not automatic multi-process aggregation. Production packaging/log-handler
+configuration, real HTTP smoke tests, and Express/Nexla validation remain pending.
 Legacy API response formats are unchanged.
 
 ## Dependencies

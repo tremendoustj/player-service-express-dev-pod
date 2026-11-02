@@ -120,10 +120,18 @@ def test_contract_covers_exactly_the_enabled_read_operations(contract, express_a
         rule.rule.replace("<string:player_id>", "{player_id}"): rule
         for rule in express_app.url_map.iter_rules()
         if rule.endpoint.startswith("express_integration.")
+        and rule.endpoint != "express_integration.get_metrics"
     }
     assert set(contract["paths"]) == set(routes) == {
         path for path, _ in OPERATIONS.values()
     }
+    assert API_PREFIX + "/metrics" not in contract["paths"]
+    metrics_rule = next(
+        rule for rule in express_app.url_map.iter_rules()
+        if rule.endpoint == "express_integration.get_metrics"
+    )
+    assert metrics_rule.rule == API_PREFIX + "/metrics"
+    assert metrics_rule.methods == {"GET", "HEAD", "OPTIONS"}
     assert contract["security"] == [{"PlayerServiceBearer": []}]
     assert contract["components"]["securitySchemes"]["PlayerServiceBearer"]["type"] == "http"
     assert contract["components"]["securitySchemes"]["PlayerServiceBearer"]["scheme"] == "bearer"

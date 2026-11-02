@@ -12,8 +12,10 @@ from urllib.parse import parse_qsl
 from uuid import uuid4
 
 from flask import Blueprint, Flask, Response, g, jsonify, request
+from prometheus_client import CONTENT_TYPE_LATEST
 from werkzeug.exceptions import HTTPException
 
+from express_metrics import ExpressMetrics
 from player_service import (
     DEFAULT_GROUP_LIMIT,
     DEFAULT_PAGE_LIMIT,
@@ -190,6 +192,8 @@ def configure_express_api(app: Flask) -> None:
     settings = IntegrationSettings.from_environment(os.environ)
     if settings is None:
         return
+    metrics = ExpressMetrics()
+    app.extensions["express_metrics"] = metrics
     api = Blueprint("express_integration", __name__, url_prefix=API_PREFIX)
 
     def player_service() -> PlayerService:
@@ -296,6 +300,12 @@ def configure_express_api(app: Flask) -> None:
         result = player_service().compare_players(player_ids)
         return success_response(result, result_count=len(result["data"]))
 
+    @api.get("/metrics")
+    def get_metrics():
+        if request.query_string:
+            return _error(400, "invalid_request", "Query parameters are not supported")
+        return app.response_class(metrics.render(), content_type=CONTENT_TYPE_LATEST)
+
     @api.errorhandler(PlayersNotFoundError)
     def players_not_found(exc):
         g.express_exception_type = type(exc).__name__
@@ -340,18 +350,25 @@ def configure_express_api(app: Flask) -> None:
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         matched = request.blueprint == api.name and request.url_rule is not None
+        duration_seconds = monotonic() - g.express_started_at
         event = {
             "event": "express_request",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "operation": request.endpoint if matched else "unmatched",
             "route": request.url_rule.rule if matched else "unmatched",
             "status": response.status_code,
-            "duration_ms": round((monotonic() - g.express_started_at) * 1000, 3),
+            "duration_ms": round(duration_seconds * 1000, 3),
             "request_id": g.express_request_id,
             "result_count": g.get("express_result_count", 0),
             "error_code": g.get("express_error_code"),
             "exception_type": g.get("express_exception_type"),
         }
+        metrics.observe(
+            operation=event["operation"],
+            status=response.status_code,
+            duration_seconds=duration_seconds,
+            error_code=event["error_code"],
+        )
         level = logging.WARNING if response.status_code >= 400 else logging.INFO
         app.logger.log(level, json.dumps(event, separators=(",", ":")))
         return response
