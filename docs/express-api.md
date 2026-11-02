@@ -2,7 +2,7 @@
 
 **Status: all five opt-in read operations (search/filter, player details,
 population statistics, numeric rankings, and comparisons) are implemented and
-locally tested.** The OpenAPI contract is not yet implemented.
+locally tested, with a validated OpenAPI 3.1 contract.**
 Metrics, production packaging, real loopback HTTP smoke tests, and authenticated
 Express/Nexla validation remain pending.
 
@@ -10,6 +10,42 @@ The [architecture assessment](express-integration-architecture.md) records the
 verified platform mechanisms, integration decision, remaining acceptance gates,
 and external blockers. These endpoints are not a published MCP server or proof of
 a working Express chat integration.
+
+## OpenAPI contract
+
+[`express-openapi.json`](express-openapi.json) is the versioned **OpenAPI 3.1.0**
+document for API contract version **1.0.0**. It contains exactly the five
+implemented GET operations, their stable operation IDs, bearer security,
+parameter bounds/defaults/enums, full nullable response schemas, error envelopes,
+and correlation/cache headers. It excludes legacy routes, Ollama, mutations,
+arbitrary SQL, and any unimplemented metrics or MCP endpoints.
+
+This is a repository artifact, **not an additional HTTP route**, deployed
+service, or verified Express/Nexla import mechanism. Its relative server URL `/`
+does not identify a remotely reachable deployment. Configure an approved HTTPS
+origin when reviewing or using it in a client; keep local HTTP on loopback.
+Use it to review generated connector/tool contracts, not to assume that Studio
+will import it or use its operation IDs automatically.
+
+Important binding details:
+
+- `player_ids` is an OpenAPI array with `style: form` and `explode: false`:
+  serialize it into **one comma-separated value**, not repeated query keys.
+- Output player schemas preserve all 24 source fields. Numeric fields are
+  nullable numbers, not necessarily integers; career dates are source strings,
+  not asserted date formats. Stored IDs in search/ranking records are not
+  constrained by the stricter detail/comparison **input** ID schema.
+- Incoming `X-Request-ID` is advisory: invalid values are replaced, not rejected.
+  Returned IDs always satisfy the bounded response schema.
+- OpenAPI parameter schemas alone do not express every wire rule: unknown or
+  duplicate parameters, canonical integer spelling, printable/nonblank Unicode,
+  and the relationship between the two year bounds still require the documented
+  server validation. The tests exercise those rules through Flask.
+
+Standards validation and response-schema checks run locally without tenant
+credentials or external schema references. Test-only validators live in
+[`requirements-test.txt`](../player-service-app/requirements-test.txt); the
+runtime dependency manifest and application behavior are unchanged.
 
 ## Configuration
 
@@ -472,10 +508,16 @@ Run local automated coverage from the repository root:
 
 ```shell
 source player-service-app/.venv/bin/activate
+python -m pip install -r player-service-app/requirements-test.txt
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
 
-The complete local suite passes **1324 tests**. Coverage includes disabled/invalid
+For an activated `uv` environment without pip, use
+`uv pip install -r player-service-app/requirements-test.txt` for installation.
+To run only the contract checks, select
+`player-service-app/tests/test_express_openapi.py` instead of the tests directory.
+
+The complete local suite passes **1449 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
@@ -500,5 +542,13 @@ differences, explicit missing/duplicate errors, bounded retrieval, invalid numer
 storage and subtraction overflow, serialization/query failures, and redacted logs.
 Five-player HTTP comparisons match independently converted seed records and all
 ten pairwise differences, including missing birth years, heights, and weights.
+The 125 OpenAPI checks validate the document and local references, match routes
+and parameter allowlists to Flask, execute parameter examples, and validate
+success/error bodies and required headers. They cover nullable/fractional
+records, empty populations, list encoding, routing failures, actual missing
+and locked storage, and rejection of malformed response shapes. Every search
+page across all **19,370 seed players** conforms to the response schema;
+seed statistics, rankings, nullable details, and maximum-size comparisons are
+also schema-checked.
 Flask test-client coverage is not
 a real network, container, live Ollama, or Express/Nexla end-to-end result.

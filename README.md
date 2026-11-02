@@ -35,8 +35,11 @@ and explicit null exclusions. Both sort directions retain ascending ID tie-break
 parameter containing 2-5 distinct IDs. It returns ordered full records and all
 pairwise, null-aware numeric differences, or a 404 if any player is missing.
 The integration is disabled by default; see the linked configuration and
-local-only setup. The OpenAPI contract, metrics, packaging, and Express/Nexla
-validation are still pending. Legacy API response formats are unchanged.
+local-only setup. The [versioned OpenAPI 3.1 contract](docs/express-openapi.json)
+describes all five operations and is checked against actual Flask responses.
+It is a local API contract, not a verified Express import format or published
+endpoint. Metrics, packaging, and Express/Nexla validation are still pending.
+Legacy API response formats are unchanged.
 
 ## Dependencies
 
@@ -79,12 +82,18 @@ validation are still pending. Legacy API response formats are unchanged.
 
 ### Part 1b: Run tests
 
-Tests do not require Docker or Ollama. From the repository root or from `player-service-app`:
+Tests do not require Docker, Ollama, or Express/Nexla credentials. Install the
+test dependencies (which include the application requirements and OpenAPI
+validators), then run from `player-service-app`:
 
 ```shell
 cd player-service-app
+python -m pip install -r requirements-test.txt
 pytest
 ```
+
+For an activated `uv` environment without pip, use
+`uv pip install -r requirements-test.txt` for the installation step instead.
 
 ### Part 2: Run Player Service (without LLM)
 

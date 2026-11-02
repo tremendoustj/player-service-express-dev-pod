@@ -4,7 +4,8 @@ Assessment date: 2026-11-02.
 
 **Status: shared data access, bounded search/filter, population statistics,
 numeric rankings, comparisons, opt-in SQLite deadlines, and authenticated HTTP
-search/details/statistics/rankings/comparisons implemented; OpenAPI pending.**
+search/details/statistics/rankings/comparisons implemented, with a validated
+OpenAPI 3.1 contract.**
 Player/country lookups are
 parameterized, reads explicitly close their read-only SQLite connections, and
 missing-player handling has regression coverage. Internal search supports validated filters and
@@ -25,7 +26,9 @@ Rankings use required allowlisted metrics, bounded pages, and explicit exclusion
 Comparisons accept 2-5 ordered IDs and return full records and null-aware
 pairwise differences, with an explicit 404 if any selected player is missing.
 [Their configuration and contracts](express-api.md) distinguish
-implemented behavior from the remaining OpenAPI, metrics, packaging, and validation work.
+implemented behavior from the remaining metrics, packaging, and validation work.
+The [versioned OpenAPI document](express-openapi.json) is a local contract, not a
+published route or a verified Express import format.
 No MCP server is implemented. No infrastructure was deployed
 and no Nexla resources were created. This document distinguishes the existing
 application, verified platform capabilities, and proposed changes.
@@ -174,8 +177,13 @@ Run the complete suite with the existing compatible virtual environment:
 
 ```shell
 source player-service-app/.venv/bin/activate
+python -m pip install -r player-service-app/requirements-test.txt
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
+
+The test manifest includes the OpenAPI validators added in increment 13 without
+changing runtime dependencies. For an activated `uv` environment without pip,
+use `uv pip install -r player-service-app/requirements-test.txt` instead.
 
 ### Bounded search and filtering (increment 3)
 
@@ -730,7 +738,7 @@ and report zero on failure without logging requested IDs or player records.
 The [HTTP contract](express-api.md#player-comparisons) documents list encoding,
 null/sign semantics, errors, HEAD/OPTIONS, and connector-binding requirements.
 
-The complete local suite has **1324 passing tests**, including 169 additional
+At the end of increment 12, the local suite had **1324 passing tests**, including 169 additional
 cases for comparisons and shared boundaries. Coverage checks exact list/ID bounds
 and case, order and all pairs, nulls/zeros/fractions, malformed and unsupported
 queries before database access, missing records, bounded duplicate detection,
@@ -742,6 +750,42 @@ including nullable measurements. All legacy/analytics regression tests pass.
 These are local Flask test-client/SQLite results, not network, Docker, live
 Ollama, or Express/Nexla validation. OpenAPI, metrics, packaging, and external
 validation remain pending. No resources were deployed or published.
+
+### Versioned OpenAPI contract (increment 13)
+
+[`express-openapi.json`](express-openapi.json) now defines the five implemented
+GET operations using OpenAPI **3.1.0**, contract version **1.0.0**. Stable operation
+IDs match the Flask read handlers. Shared definitions cover bearer security,
+required/optional parameters, bounds/defaults/enums, nullable 24-field records,
+all five distinct response envelopes, errors, and correlation/cache headers.
+The comparison array explicitly uses form serialization with `explode: false`
+so clients send one comma-separated `player_ids` value.
+
+Only the existing integration reads appear in the contract. It does not expose
+a schema route, deploy a service, implement MCP, or claim a supported Express
+import. The relative server origin must be configured for an approved HTTPS
+deployment before remote use. The [HTTP guide](express-api.md#openapi-contract)
+explains strict wire rules that parameter schemas alone cannot express and
+the distinction between bounded lookup IDs and unnormalized stored records.
+Application/business logic, runtime dependencies, and legacy behavior are
+unchanged.
+
+Test-only OpenAPI validators are installed through
+[`requirements-test.txt`](../player-service-app/requirements-test.txt).
+The complete local suite has **1449 passing tests**, including **125 contract
+checks**. These validate the document and internal references, detect route and
+parameter-allowlist drift, execute documented parameter examples, and validate
+actual Flask success/error bodies and required headers. Coverage includes
+empty/null/fractional values, comparison serialization, malformed input,
+routing errors, real missing/locked storage and recovery, sanitized failures,
+HEAD/OPTIONS headers, and negative response-schema cases.
+
+Schema validation traverses all **19,370 seed players** through authenticated
+search pages and covers seed statistics, rankings, nullable details, and
+five-player/ten-pair comparisons. Standards and schema checks are local, not
+network or Express/Nexla validation. Operational metrics, production packaging,
+real HTTP smoke tests, and approval-gated tenant validation remain pending.
+No resources were deployed or published.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -765,7 +809,7 @@ never in chat, a tool argument, a query parameter, or a committed file. Keep TLS
 certificate verification enabled.
 
 No undocumented `/chat` automation, MCP registration endpoint on express.dev,
-or import format is needed. The OpenAPI document proposed below is our API
+or import format is needed. The OpenAPI document linked below is our API
 contract; it must not be presented as a verified Express import mechanism.
 
 ## 3. Architecture decision
@@ -805,14 +849,15 @@ than assuming Gateway registration alone completes that step.
 Neither path permits arbitrary SQL, arbitrary outbound URLs, mutations,
 recommendation feedback, or Ollama chat as an integration tool.
 
-## 4. Application/tool contract (partially implemented)
+## 4. Application/tool contract (HTTP contract implemented)
 
-All five read-only HTTP operations are implemented; the OpenAPI contract remains
-**planned**, not implemented.
+All five read-only HTTP operations and the
+[OpenAPI 3.1 contract](express-openapi.json) are implemented and locally tested.
+Generated Express/Nexla tool bindings remain unverified.
 Internal search/filter, statistics, ranking, and comparison semantics are
 implemented as described in increments 3 through 6.
-The opt-in blueprint uses `/integrations/express/v1`. The proposed operation
-names are also the desired tool names; Studio's actual generated names and
+The opt-in blueprint uses `/integrations/express/v1`. The contract's operation
+IDs are also the desired tool names; Studio's actual generated names and
 schemas must be inspected rather than assumed to match automatically.
 
 | Operation | GET route / status | Supported semantics |
@@ -849,7 +894,7 @@ Only fixed, allowlisted columns/operations may participate in queries.
 - Offset pagination is adequate for the small, static dataset. Full-scan
   validation must use one database revision; do not promise snapshot consistency
   across a later data refresh.
-- Publish and test an OpenAPI contract for these new routes, including enums,
+- Maintain and test the versioned OpenAPI contract for these routes, including enums,
   bounds, nullability, envelopes, errors, and authentication. Preserve the legacy
   bare-array/detail responses and do not add mandatory authentication to `/v1/*`.
 
@@ -949,7 +994,7 @@ or document and validate a deliberate compatibility decision.
 | Authenticated population-statistics HTTP (**complete**) | Shared strict filter parsing and separate parameter allowlists, bounded groups over full-population aggregates, explicit null/omitted counts, safe serialization/failure mapping, configured deadlines, correlated/redacted logs, and independent fixture/seed expectations. |
 | Authenticated numeric-ranking HTTP (**complete**) | Shared enum/filter/page validation before database access, bounded pages with stable ties and explicit exclusions, safe errors/serialization, configured deadlines, redacted logs, and complete HTTP seed pagination in all six metric/direction combinations against independent CSV expectations. |
 | Authenticated player-comparison HTTP (**complete**) | Shared cardinality/ID/uniqueness validation before database access, one ordered comma-separated ID parameter, bounded read and pairwise output, safe missing/duplicate/overflow errors, configured deadlines, redacted logs, and independent fixture/seed expectations. |
-| Integration API schema | Publish/test the OpenAPI contract for all five operations, including list serialization, nullable output, malformed inputs, unavailable/locked storage, and missing records, without changing legacy routes. |
+| Integration API schema (**complete**) | Versioned OpenAPI 3.1 contract for all five operations; standards validation, route/parameter drift checks, list serialization, nullable output, malformed inputs, unavailable/locked storage, missing records, and full-seed schema coverage, without changing legacy routes. |
 | Operational observability | Extend the implemented correlation IDs/redacted request log messages with production logging configuration, bounded metrics labels, counters, and latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
 | Express/Nexla validation | Operator-approved, authenticated Studio/connector setup; review generated contracts and call every capability, inspect receipts, and compare with local expected results. If a custom MCP adapter is necessary, add and verify it before claiming this gate. Otherwise document exact outstanding external blockers. |
@@ -1009,7 +1054,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10/11/12 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10/11/12/13 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.
