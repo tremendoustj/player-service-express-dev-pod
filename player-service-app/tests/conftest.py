@@ -75,6 +75,38 @@ def expected_statistics():
 
 
 @pytest.fixture
+def expected_rankings():
+    def calculate(records, metric="height", direction="desc", limit=20, offset=0):
+        known = [record for record in records if record[metric] is not None]
+        ordered = sorted(
+            known,
+            key=lambda record: (
+                float(record[metric]) * (-1 if direction == "desc" else 1),
+                record["playerId"],
+            ),
+        )
+        next_offset = offset + limit
+        return {
+            "metric": metric,
+            "direction": direction,
+            "excluded_count": len(records) - len(known),
+            "data": ordered[offset : offset + limit],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": len(known),
+                "next_offset": (
+                    next_offset
+                    if next_offset < len(known) and next_offset <= 100000
+                    else None
+                ),
+            },
+        }
+
+    return calculate
+
+
+@pytest.fixture
 def player_records():
     records = [
         {

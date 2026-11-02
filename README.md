@@ -28,8 +28,11 @@ duplicate stored IDs; legacy detail behavior is unchanged.
 through the same boundary, with shared filters and a bounded `group_limit`.
 It reports null measurements and omitted groups explicitly, without pagination
 or performance-statistics claims.
+`GET /integrations/express/v1/rankings` exposes numeric rankings with a required
+`metric` (`height`, `weight`, or `birthYear`), shared filters, bounded pagination,
+and explicit null exclusions. Both sort directions retain ascending ID tie-breaks.
 It is disabled by default; see the linked configuration and local-only setup.
-Rankings/comparisons HTTP endpoints, the OpenAPI contract, metrics, packaging, and
+The comparison HTTP endpoint, the OpenAPI contract, metrics, packaging, and
 Express/Nexla validation are still pending. Legacy API response formats are
 unchanged.
 

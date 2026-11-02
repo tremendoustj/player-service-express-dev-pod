@@ -4,7 +4,7 @@ Assessment date: 2026-11-02.
 
 **Status: shared data access, bounded search/filter, population statistics,
 numeric rankings, comparisons, opt-in SQLite deadlines, and authenticated HTTP
-search/details/statistics implemented; remaining Express API operations/schema pending.**
+search/details/statistics/rankings implemented; comparison HTTP and OpenAPI pending.**
 Player/country lookups are
 parameterized, reads explicitly close their read-only SQLite connections, and
 missing-player handling has regression coverage. Internal search supports validated filters and
@@ -14,12 +14,14 @@ with deterministic ties and explicit null exclusions. Comparisons preserve
 requested player order, report pairwise numeric differences, and reject missing IDs.
 All shared reads can opt into a monotonic execution budget and bounded lock waits;
 legacy calls retain their existing timeout defaults.
-The opt-in search/filter, detail, and statistics endpoints now have fail-closed configuration,
-bearer authentication, strict HTTP validation, correlation IDs, and sanitized structured
-request log messages. Detail reads validate exact IDs, bound duplicate detection,
+The opt-in search/filter, detail, statistics, and ranking endpoints now have
+fail-closed configuration, bearer authentication, strict HTTP validation,
+correlation IDs, and sanitized structured request log messages.
+Detail reads validate exact IDs, bound duplicate detection,
 and return an explicit 404 for absent players.
 Statistics describe the entire filtered population with bounded groups and
 explicit missing/omitted counts, not a paginated subset.
+Rankings use required allowlisted metrics, bounded pages, and explicit exclusions.
 [Their configuration and contracts](express-api.md) distinguish
 implemented behavior from the remaining endpoints, OpenAPI, metrics, and packaging.
 No MCP server is implemented. No infrastructure was deployed
@@ -47,9 +49,9 @@ and countries as SQL parameters and explicitly closes each read-only connection.
 The initial assessment found interpolated lookups and unclosed connections; the
 safe shared data-access increment below addresses those prerequisites.
 Legacy routes remain unauthenticated and retain their original responses.
-The additive integration search/detail/statistics endpoints implement authentication, validation,
-request correlation, and structured log messages. Operational metrics and
-production HTTP request limits remain pending. Shared service reads support
+The additive integration search/detail/statistics/ranking endpoints implement
+authentication, validation, request correlation, and structured log messages.
+Operational metrics and production HTTP request limits remain pending. Shared service reads support
 optional SQLite deadlines, enabled for all implemented integration operations but not for legacy routes.
 The development entry point binds port 8000 on all interfaces with debug enabled.
 Live Ollama requests remain unverified; the missing-player error path now has
@@ -318,8 +320,9 @@ or environment variables.
 ### Bounded numeric rankings (increment 5)
 
 `PlayerService.rank_players(metric, filters=None, *, direction="desc", limit=20,
-offset=0)` is an internal Python method, **not an HTTP endpoint or published
-tool**. The required `metric` is exactly `height`, `weight`, or `birthYear`.
+offset=0)` was introduced as an internal Python method; increment 11 now exposes
+it through authenticated HTTP, not a published tool. The required `metric` is
+exactly `height`, `weight`, or `birthYear`.
 `direction` is exactly `asc` or `desc`, defaulting to `desc`. No performance
 statistics, measurement units, age calculations, or player-quality claims are
 introduced.
@@ -574,7 +577,8 @@ success/failure responses remain compatible. These are local Flask/SQLite
 results, not real network, Express/Nexla, MCP, Docker, or live Ollama validation.
 
 This was deliberately the first HTTP operation, not the entire API gate. Detail
-and statistics are implemented in increments 9 and 10 below. Rankings, comparisons,
+and statistics are implemented in increments 9 and 10 below; rankings follow in
+increment 11. Comparisons,
 the OpenAPI contract, operational metrics, production packaging/logging, and
 real network/external validation remain pending. No platform resources were
 created or published.
@@ -641,8 +645,8 @@ The [HTTP contract](express-api.md#population-statistics) documents accepted inp
 output shape, null/truncation semantics, HEAD/OPTIONS, and connector-binding
 considerations; search's `$.data` extraction is not suitable for this envelope.
 
-The complete local suite has **970 passing tests**, including 131 additional
-cases for statistics and shared boundaries. Coverage checks each filter, full
+At the end of increment 10, the local suite had **970 passing tests**, including
+131 additional cases for statistics and shared boundaries. Coverage checks each filter, full
 population counts, default/minimum/maximum group limits over 101 categories,
 nulls, empty results, strict parsing before reads, disabled/authenticated routes,
 redacted logs, real SQLite lock/deadline failures, failure cleanup, and independent
@@ -650,8 +654,49 @@ CSV-derived aggregates over all **19,370 players** and a filtered population.
 The independent statistics expectation helper is shared by service and HTTP
 tests; no service result is used as the expected HTTP aggregate. These are local
 Flask test-client/SQLite results, not network, Docker, live Ollama, or Express/Nexla
-validation. Rankings/comparisons HTTP, OpenAPI, metrics, packaging, and external
-validation remain pending. No resources were deployed or published.
+validation. Rankings HTTP is implemented in increment 11 below; comparisons HTTP,
+OpenAPI, metrics, packaging, and external validation remain pending.
+No resources were deployed or published.
+
+### Authenticated numeric rankings (increment 11)
+
+`GET /integrations/express/v1/rankings` now exposes the existing ranking service
+through the opt-in authenticated boundary. `metric` is required and exactly
+`height`, `weight`, or `birthYear`; `direction` is `asc` or `desc`, defaulting to
+`desc`. All six shared filters and search's bounded `limit`/`offset` pagination
+are supported. Only these ten scalar parameters are accepted.
+
+The HTTP and service layers share the ranking enum validator and fixed SQL
+identifier maps. Search and rankings share HTTP pagination parsing. Invalid
+enums, filters, pages, duplicate/unknown parameters, and malformed encoding fail
+before constructing the service or reading its schema. Business query semantics
+and legacy behavior are unchanged.
+
+Success contains `metric`, `direction`, `excluded_count`, `data`, `pagination`,
+and `request_id`. Full nullable records retain ascending binary ID tie-breaks
+in both directions. Totals count rankable players; exclusions count null metrics
+across the entire filtered population, independently of the page. Errors,
+deadlines, strict serialization, and correlation use the shared HTTP boundary.
+Invalid metric values anywhere within the filters, including off-page rows,
+produce sanitized 503 errors; invalid values outside the filters do not block
+valid results. Logs count returned page rows, not rankable totals or exclusions.
+The [HTTP contract](express-api.md#numeric-rankings) documents these distinctions
+and the metadata that generated connector/tool bindings must retain.
+
+The complete local suite has **1155 passing tests**, including 185 additional
+cases for rankings and shared boundaries. Coverage checks required/case-sensitive
+enums, all ten inputs together, literal filters, exact page/offset bounds, binary
+ties, empty/all-null populations, null exclusions, off-page invalid storage,
+page/serialization failures, authentication before reads, configured deadlines,
+real SQLite cancellation/lock failures, cleanup, and redacted logs.
+An independent ranking expectation helper is shared by service and HTTP tests.
+Complete authenticated Flask test-client pagination in all six metric/direction
+combinations matches CSV-derived full records over the **19,370-player** seed:
+18,615 rankable heights, 18,533 weights, and 19,244 birth years. Filtered seed
+rankings and all legacy/analytics regression tests also pass.
+These are local Flask/SQLite results, not network, Docker, live Ollama, or
+Express/Nexla validation. Comparisons HTTP, OpenAPI, metrics, packaging, and
+external validation remain pending. No resources were deployed or published.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -717,8 +762,8 @@ recommendation feedback, or Ollama chat as an integration tool.
 
 ## 4. Application/tool contract (partially implemented)
 
-Search/filter, detail, and statistics HTTP are implemented; the other contracts in this section
-are **planned**, not existing routes.
+Search/filter, detail, statistics, and ranking HTTP are implemented; comparison
+HTTP and the OpenAPI contract are **planned**, not implemented.
 Internal search/filter, statistics, ranking, and comparison semantics are
 implemented as described in increments 3 through 6.
 The opt-in blueprint uses `/integrations/express/v1`. The proposed operation
@@ -730,7 +775,7 @@ schemas must be inspected rather than assumed to match automatically.
 | `search_players` | `/players` (**implemented**) | Search IDs/names and filter by birth country, inclusive birth-year range, bats, and throws. Search and filtering share one query implementation. |
 | `get_player` | `/players/{player_id}` (**implemented**) | Retrieve a single full record by exact, case-sensitive ID; return 404 if absent, or 503 if selected stored IDs are duplicated. No query parameters or pagination. |
 | `get_player_statistics` | `/statistics` (**implemented**) | Count the entire filtered population; bounded groups by birth country/bats/throws; count/min/max/mean for birth year, height, and weight. Include known/missing/omitted counts. Accept shared filters and `group_limit` (1-100, default 20), not pagination. |
-| `rank_players` | `/rankings` (pending) | Order by the allowlisted `height`, `weight`, or `birthYear`, with `asc`/`desc` direction (default `desc`) and ascending player-ID tie-breaks. Exclude null metrics and report `excluded_count`; pagination totals count rankable players. No performance-quality claim. |
+| `rank_players` | `/rankings` (**implemented**) | Require `metric` as `height`, `weight`, or `birthYear`; accept shared filters and bounded pagination, with `asc`/`desc` direction (default `desc`) and ascending player-ID tie-breaks. Exclude null metrics and report `excluded_count`; pagination totals count rankable players. No performance-quality claim. |
 | `compare_players` | `/comparisons` (pending) | Compare 2-5 distinct player IDs in supplied order, with all pairwise left-minus-right differences for birth year, height, and weight. Differences are null if either value is unknown. Any missing ID is an explicit error, not a silently incomplete comparison. |
 
 This covers all six requested capabilities with five operations: filtering is a
@@ -778,7 +823,7 @@ Only fixed, allowlisted columns/operations may participate in queries.
   query-only enforcement. A missing database must fail clearly, not create an
   empty database during a tool call.
 - The service now supports bounded busy waits and monotonic query deadlines
-  (increment 7). Integration search/details/statistics opt into the default 1-second
+  (increment 7). Integration search/details/statistics/rankings opt into the default 1-second
   busy wait and 2-second read budget; remaining routes must use the same boundary.
   Legacy defaults are unchanged. A connection
   timeout alone does **not** limit query execution. Bound request size and
@@ -857,7 +902,8 @@ or document and validate a deliberate compatibility decision.
 | Authenticated search/filter HTTP (**complete**) | Opt-in route and fail-closed settings, strict header/query/body handling before reads, configured deadlines, safe errors, request IDs/log messages, full-seed HTTP test-client pagination, and legacy/Ollama compatibility (Ollama mocked). |
 | Authenticated player-detail HTTP (**complete**) | Shared strict ID validation, exact binary identity, one bounded read with duplicate detection, safe missing-player 404, shared authentication/deadlines/serialization/logging, seed-backed records, and unchanged legacy lookup contracts. |
 | Authenticated population-statistics HTTP (**complete**) | Shared strict filter parsing and separate parameter allowlists, bounded groups over full-population aggregates, explicit null/omitted counts, safe serialization/failure mapping, configured deadlines, correlated/redacted logs, and independent fixture/seed expectations. |
-| Remaining integration API and schema | Wire rankings/comparisons through the same authenticated boundary and publish/test the OpenAPI contract. Cover all operations, malformed inputs, unavailable/locked storage, and missing records without changing legacy routes. |
+| Authenticated numeric-ranking HTTP (**complete**) | Shared enum/filter/page validation before database access, bounded pages with stable ties and explicit exclusions, safe errors/serialization, configured deadlines, redacted logs, and complete HTTP seed pagination in all six metric/direction combinations against independent CSV expectations. |
+| Remaining integration API and schema | Wire comparisons through the same authenticated boundary and publish/test the OpenAPI contract. Cover all operations, malformed inputs, unavailable/locked storage, and missing records without changing legacy routes. |
 | Operational observability | Extend the implemented correlation IDs/redacted request log messages with production logging configuration, bounded metrics labels, counters, and latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
 | Express/Nexla validation | Operator-approved, authenticated Studio/connector setup; review generated contracts and call every capability, inspect receipts, and compare with local expected results. If a custom MCP adapter is necessary, add and verify it before claiming this gate. Otherwise document exact outstanding external blockers. |
@@ -917,7 +963,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10/11 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.

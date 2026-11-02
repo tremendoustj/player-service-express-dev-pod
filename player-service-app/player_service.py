@@ -22,6 +22,8 @@ DEFAULT_BUSY_TIMEOUT_SECONDS = 5.0
 MIN_QUERY_TIMEOUT_SECONDS = 0.001
 MAX_DB_TIMEOUT_SECONDS = 60.0
 _PROGRESS_HANDLER_STEPS = 1000
+_RANKING_COLUMNS = {"height": "height", "weight": "weight", "birthYear": "birthYear"}
+_RANKING_DIRECTIONS = {"asc": "ASC", "desc": "DESC"}
 
 
 def validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
@@ -39,6 +41,13 @@ def validate_player_id(player_id: str) -> None:
         raise ValueError(
             f"player IDs must be 1-{MAX_PLAYER_ID_LENGTH} ASCII alphanumeric characters"
         )
+
+
+def validate_ranking(metric: str, direction: str) -> None:
+    if not isinstance(metric, str) or metric not in _RANKING_COLUMNS:
+        raise ValueError("metric must be one of height, weight, birthYear")
+    if not isinstance(direction, str) or direction not in _RANKING_DIRECTIONS:
+        raise ValueError("direction must be one of asc, desc")
 
 
 def validate_db_timeout(name: str, value: float, minimum: float) -> None:
@@ -290,17 +299,12 @@ class PlayerService:
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> dict:
-        columns = {"height": "height", "weight": "weight", "birthYear": "birthYear"}
-        directions = {"asc": "ASC", "desc": "DESC"}
-        if not isinstance(metric, str) or metric not in columns:
-            raise ValueError("metric must be one of height, weight, birthYear")
-        if not isinstance(direction, str) or direction not in directions:
-            raise ValueError("direction must be one of asc, desc")
+        validate_ranking(metric, direction)
         where_clause, parameters = self._filter_clause(filters)
         validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
         validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
-        column = columns[metric]
-        order = directions[direction]
+        column = _RANKING_COLUMNS[metric]
+        order = _RANKING_DIRECTIONS[direction]
         ranked_where = (
             f"{where_clause} AND {column} IS NOT NULL"
             if where_clause

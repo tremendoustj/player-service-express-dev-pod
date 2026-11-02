@@ -28,6 +28,7 @@ from player_service import (
     validate_db_timeout,
     validate_integer,
     validate_player_id,
+    validate_ranking,
 )
 
 
@@ -50,6 +51,7 @@ _FILTER_PARAMETERS = frozenset(
 )
 _SEARCH_PARAMETERS = _FILTER_PARAMETERS | {"limit", "offset"}
 _STATISTICS_PARAMETERS = _FILTER_PARAMETERS | {"group_limit"}
+_RANKING_PARAMETERS = _SEARCH_PARAMETERS | {"metric", "direction"}
 
 
 @dataclass(frozen=True)
@@ -167,13 +169,18 @@ def _player_filters(arguments: Mapping[str, str]) -> PlayerFilters:
     )
 
 
-def _search_arguments() -> tuple[PlayerFilters, int, int]:
-    arguments = _query_arguments(_SEARCH_PARAMETERS)
-    filters = _player_filters(arguments)
+def _pagination_arguments(arguments: Mapping[str, str]) -> tuple[int, int]:
     limit = _integer(
         "limit", arguments.get("limit", str(DEFAULT_PAGE_LIMIT)), 1, MAX_PAGE_LIMIT
     )
     offset = _integer("offset", arguments.get("offset", "0"), 0, MAX_PAGE_OFFSET)
+    return limit, offset
+
+
+def _search_arguments() -> tuple[PlayerFilters, int, int]:
+    arguments = _query_arguments(_SEARCH_PARAMETERS)
+    filters = _player_filters(arguments)
+    limit, offset = _pagination_arguments(arguments)
     return filters, limit, offset
 
 
@@ -258,6 +265,22 @@ def configure_express_api(app: Flask) -> None:
             return _error(400, "invalid_request", str(exc))
         result = player_service().get_player_statistics(filters, group_limit=group_limit)
         return success_response(result, result_count=result["total"])
+
+    @api.get("/rankings")
+    def rank_players():
+        try:
+            arguments = _query_arguments(_RANKING_PARAMETERS)
+            metric = arguments.get("metric", "")
+            direction = arguments.get("direction", "desc")
+            validate_ranking(metric, direction)
+            filters = _player_filters(arguments)
+            limit, offset = _pagination_arguments(arguments)
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
+        result = player_service().rank_players(
+            metric, filters, direction=direction, limit=limit, offset=offset
+        )
+        return success_response(result, result_count=len(result["data"]))
 
     @api.errorhandler(PlayersNotFoundError)
     def players_not_found(exc):

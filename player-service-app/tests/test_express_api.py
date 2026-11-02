@@ -17,6 +17,9 @@ PLAYERS_URL = API_PREFIX + "/players"
 DETAIL_URL = PLAYERS_URL + "/aaronha01"
 DETAIL_ROUTE = PLAYERS_URL + "/<string:player_id>"
 STATISTICS_URL = API_PREFIX + "/statistics"
+RANKINGS_URL = API_PREFIX + "/rankings"
+HEIGHT_RANKINGS_URL = RANKINGS_URL + "?metric=height"
+READ_URLS = [PLAYERS_URL, DETAIL_URL, STATISTICS_URL, HEIGHT_RANKINGS_URL]
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +46,7 @@ def assert_error(response, status, code):
 @pytest.mark.parametrize(
     "path",
     [
-        API_PREFIX, PLAYERS_URL, DETAIL_URL, STATISTICS_URL,
+        API_PREFIX, PLAYERS_URL, DETAIL_URL, STATISTICS_URL, RANKINGS_URL,
         PLAYERS_URL + "/bad-id", API_PREFIX + "/unknown",
     ],
 )
@@ -529,10 +532,289 @@ def test_invalid_statistics_arguments_fail_before_any_database_access(
     assert tracked_connections == []
 
 
-def test_search_does_not_accept_statistics_parameters(
-    express_client, express_headers, tracked_connections
+@pytest.mark.parametrize(
+    "query", ["group_limit=1", "metric=height", "direction=asc"]
+)
+def test_search_does_not_accept_analytics_parameters(
+    express_client, express_headers, tracked_connections, query
 ):
-    response = express_client.get(PLAYERS_URL + "?group_limit=1", headers=express_headers)
+    response = express_client.get(PLAYERS_URL + "?" + query, headers=express_headers)
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+@pytest.mark.parametrize("metric", ["height", "weight", "birthYear"])
+@pytest.mark.parametrize("direction", [None, "asc", "desc"])
+def test_rankings_preserve_records_counts_and_page_metadata(
+    express_client, express_headers, player_records, expected_rankings,
+    caplog, metric, direction
+):
+    caplog.set_level(logging.INFO)
+    query = {"metric": metric, "limit": "1"}
+    if direction is not None:
+        query["direction"] = direction
+
+    response = express_client.get(
+        RANKINGS_URL,
+        query_string=query,
+        headers={**express_headers, "X-Request-ID": "rankings-123"},
+    )
+
+    assert response.status_code == 200
+    assert response.is_json
+    assert response.get_json() == {
+        **expected_rankings(player_records, metric, direction or "desc", limit=1),
+        "request_id": "rankings-123",
+    }
+    assert response.headers["X-Request-ID"] == "rankings-123"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["operation"] == "express_integration.rank_players"
+    assert event["route"] == RANKINGS_URL
+    assert event["result_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("query", "indexes"),
+    [
+        ({}, [0, 1, 2, 3]),
+        ({"q": "AARON"}, [0, 1]),
+        ({"q": "Henry Louis"}, [0]),
+        ({"q": "ren\u00e9"}, [2]),
+        ({"q": "REN\u00c9"}, []),
+        ({"q": "unknown01"}, [3]),
+        ({"q": "' OR 1=1 --"}, []),
+        ({"q": "%"}, []),
+        ({"q": "_"}, []),
+        ({"q": "\\"}, []),
+        ({"birth_country": "C\u00f4te d'Ivoire"}, [2]),
+        ({"birth_country": "usa"}, []),
+        ({"birth_country": "USA' OR 1=1 --"}, []),
+        ({"birth_year_min": "1939"}, [1]),
+        ({"birth_year_max": "1934"}, [0]),
+        ({"birth_year_min": "1", "birth_year_max": "9999"}, [0, 1]),
+        ({"bats": "B"}, [2]),
+        ({"throws": "S"}, [2]),
+        ({"q": "x" * 100, "birth_country": "x" * 100}, []),
+        (
+            {
+                "q": "Aaron",
+                "birth_country": "USA",
+                "birth_year_min": "1934",
+                "birth_year_max": "1939",
+                "bats": "R",
+                "throws": "R",
+                "direction": "asc",
+                "limit": "1",
+                "offset": "1",
+            },
+            [0, 1],
+        ),
+    ],
+)
+def test_ranking_filters_apply_to_both_rankable_and_excluded_counts(
+    express_client, express_headers, player_records, expected_rankings, query, indexes
+):
+    response = express_client.get(
+        RANKINGS_URL, query_string={"metric": "height", **query}, headers=express_headers
+    )
+    expected = expected_rankings(
+        [player_records[index] for index in indexes],
+        direction=query.get("direction", "desc"),
+        limit=int(query.get("limit", "20")),
+        offset=int(query.get("offset", "0")),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected, "request_id": response.headers["X-Request-ID"]
+    }
+    assert expected["pagination"]["total"] + expected["excluded_count"] == len(indexes)
+
+
+@pytest.mark.parametrize("q", ["%", "_", "\\"])
+def test_ranking_search_matches_literal_wildcards(
+    express_client, express_headers, player_db, player_records, expected_rankings, q
+):
+    record = {**player_records[0], "nameGiven": r"Marker\%_value"}
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            "UPDATE players SET nameGiven = ? WHERE playerId = ?",
+            (record["nameGiven"], record["playerId"]),
+        )
+        conn.commit()
+
+    response = express_client.get(
+        RANKINGS_URL,
+        query_string={"metric": "height", "q": q},
+        headers=express_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_rankings([record]), "request_id": response.headers["X-Request-ID"]
+    }
+
+
+def test_rankings_accept_percent_encoded_enum_and_page_parameters(
+    express_client, express_headers, player_records, expected_rankings
+):
+    response = express_client.get(
+        RANKINGS_URL + "?%6detric=%62irthYear&%64irection=%61sc"
+        "&%6cimit=%31&%6Fffset=%31&birth_country=USA",
+        headers=express_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_rankings(player_records[:2], "birthYear", "asc", limit=1, offset=1),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {},
+        {"limit": "1"},
+        {"limit": "100"},
+        {"limit": "1", "offset": "1"},
+        {"limit": "100", "offset": "100"},
+        {"limit": "100", "offset": "100000"},
+    ],
+)
+def test_rankings_enforce_exact_page_sizes_and_offset_boundaries(
+    express_client, express_headers, player_db, player_records, expected_rankings, query
+):
+    records = [
+        {**dict.fromkeys(player_records[0]), "playerId": f"p{index:03d}", "height": 72.0}
+        for index in reversed(range(101))
+    ]
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.executemany(
+            "INSERT INTO players (playerId, height) VALUES (?, ?)",
+            [(record["playerId"], record["height"]) for record in records],
+        )
+        conn.commit()
+
+    response = express_client.get(
+        RANKINGS_URL, query_string={"metric": "height", **query}, headers=express_headers
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_rankings(
+            records, limit=int(query.get("limit", "20")), offset=int(query.get("offset", "0"))
+        ),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize("direction", ["asc", "desc"])
+def test_rankings_keep_binary_ascending_ties_across_http_pages(
+    express_client, express_headers, player_db, direction
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.executemany(
+            "INSERT INTO players (playerId, height) VALUES (?, ?)",
+            [
+                ("a", 72), ("Z", 72), ("A", 72), ("z", 72),
+                ("tall", 75), ("short", 69), ("missing", None),
+            ],
+        )
+        conn.commit()
+    received_ids = []
+    for offset in (0, 2, 4):
+        response = express_client.get(
+            RANKINGS_URL,
+            query_string={
+                "metric": "height", "direction": direction,
+                "limit": "2", "offset": str(offset),
+            },
+            headers=express_headers,
+        )
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload["excluded_count"] == 1
+        assert payload["pagination"] == {
+            "limit": 2, "offset": offset, "total": 6,
+            "next_offset": offset + 2 if offset < 4 else None,
+        }
+        received_ids.extend(row["playerId"] for row in payload["data"])
+    assert received_ids == (
+        ["short", "A", "Z", "a", "z", "tall"]
+        if direction == "asc"
+        else ["tall", "A", "Z", "a", "z", "short"]
+    )
+
+
+@pytest.mark.parametrize("metric", ["height", "weight", "birthYear"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_empty_and_all_null_rankings_are_successful_with_explicit_counts(
+    express_client, express_headers, player_db, player_records, expected_rankings,
+    metric, empty
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players" if empty else f"UPDATE players SET {metric} = NULL")
+        conn.commit()
+    records = [] if empty else [{**record, metric: None} for record in player_records]
+
+    response = express_client.get(
+        RANKINGS_URL, query_string={"metric": metric}, headers=express_headers
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_rankings(records, metric),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "direction=asc",
+        "metric=",
+        "metric=HEIGHT",
+        "metric=birthyear",
+        "metric=homeRuns",
+        "metric=age",
+        "metric=playerId",
+        "metric=height%20",
+        "metric=%20height",
+        "metric=height%00",
+        "metric=%EF%BD%88eight",
+        "metric=%2568eight",
+        "metric=height+DESC",
+        "metric=height%3B+DROP+TABLE+players%3B+--",
+        "metric=height&direction=",
+        "metric=height&direction=ASC",
+        "metric=height&direction=DESC",
+        "metric=height&direction=ascending",
+        "metric=height&direction=asc%20",
+        "metric=height&direction=desc%3B+DROP+TABLE+players%3B+--",
+        "metric=height&metric=weight",
+        "metric=height&%6detric=weight",
+        "metric=height&direction=asc&direction=desc",
+        "metric=height&direction=asc&%64irection=desc",
+        "metric[]=height",
+        "metric=height&direction[]=asc",
+        "metric=height&group_limit=1",
+        "metric=height&sort=weight",
+        "metric=height&sql=SELECT+*+FROM+players",
+        "metric=height&player_ids=aaronha01",
+        "metric=height&" + "&".join("q=a" for _ in range(10)),
+    ],
+)
+def test_invalid_ranking_arguments_fail_before_any_database_access(
+    express_client, express_headers, tracked_connections, query
+):
+    response = express_client.get(RANKINGS_URL + "?" + query, headers=express_headers)
 
     assert_error(response, 400, "invalid_request")
     assert tracked_connections == []
@@ -582,10 +864,12 @@ def test_search_does_not_accept_statistics_parameters(
         "&".join("q=a" for _ in range(9)),
     ],
 )
-@pytest.mark.parametrize("url", [PLAYERS_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, STATISTICS_URL, RANKINGS_URL])
 def test_invalid_inputs_fail_before_any_database_read(
     express_client, express_headers, tracked_connections, query, url
 ):
+    if url == RANKINGS_URL:
+        query = "metric=height&" + query
     response = express_client.get(
         url + "?" + query, headers=express_headers
     )
@@ -600,7 +884,7 @@ def test_invalid_inputs_fail_before_any_database_read(
         (MAX_QUERY_STRING_BYTES + 1, 414, "request_too_large"),
     ],
 )
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL, RANKINGS_URL])
 def test_exact_query_string_size_boundary(
     express_client, express_headers, tracked_connections, size, status, code, url
 ):
@@ -622,7 +906,7 @@ def test_request_size_is_checked_after_authentication(
 
 
 @pytest.mark.parametrize("input_terminated", [False, True])
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_request_bodies_are_rejected_without_reading_them(
     express_client, express_headers, tracked_connections, input_terminated, url
 ):
@@ -647,7 +931,7 @@ def test_request_bodies_are_rejected_without_reading_them(
 
 
 @pytest.mark.parametrize("input_terminated", [False, True])
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_transfer_encoded_bodies_are_rejected(
     express_client, express_headers, tracked_connections, input_terminated, url
 ):
@@ -723,6 +1007,9 @@ def test_unsafe_request_ids_are_replaced(
         (STATISTICS_URL, "POST", 405, "method_not_allowed"),
         (STATISTICS_URL, "DELETE", 405, "method_not_allowed"),
         (STATISTICS_URL + "/", "GET", 404, "not_found"),
+        (RANKINGS_URL, "POST", 405, "method_not_allowed"),
+        (RANKINGS_URL, "DELETE", 405, "method_not_allowed"),
+        (RANKINGS_URL + "/", "GET", 404, "not_found"),
     ],
 )
 def test_routing_errors_are_correlated_and_do_not_query(
@@ -735,7 +1022,7 @@ def test_routing_errors_are_correlated_and_do_not_query(
     assert tracked_connections == []
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_head_and_options_require_authentication(
     express_client, express_headers, tracked_connections, url
 ):
@@ -763,7 +1050,7 @@ def test_head_and_options_require_authentication(
         ),
     ],
 )
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_http_reads_use_configured_deadlines(
     express_app, express_headers, monkeypatch, overrides, expected, url
 ):
@@ -793,6 +1080,10 @@ def test_http_reads_use_configured_deadlines(
         (
             STATISTICS_URL, "get_player_statistics",
             {"q": "sensitive-search"}, STATISTICS_URL,
+        ),
+        (
+            RANKINGS_URL, "rank_players",
+            {"metric": "height", "q": "sensitive-search"}, RANKINGS_URL,
         ),
     ],
 )
@@ -836,7 +1127,7 @@ def test_safe_error_mapping_and_redacted_failure_logs(
         assert sensitive not in response.get_data(as_text=True)
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_missing_storage_returns_503_without_recreating_it(
     express_client, express_headers, player_db, url
 ):
@@ -847,7 +1138,7 @@ def test_missing_storage_returns_503_without_recreating_it(
 
 
 @pytest.mark.parametrize("invalid", [float("inf"), -float("inf"), b"not-json"])
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_invalid_stored_json_never_becomes_a_successful_response(
     express_client, express_headers, player_db, invalid, url
 ):
@@ -860,7 +1151,7 @@ def test_invalid_stored_json_never_becomes_a_successful_response(
     assert "not-json" not in response.get_data(as_text=True)
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_real_lock_exhaustion_is_503_and_releases_connections(
     express_app, express_headers, player_db, monkeypatch, url
 ):
@@ -877,7 +1168,7 @@ def test_real_lock_exhaustion_is_503_and_releases_connections(
         assert client.get(url, headers=express_headers).status_code == 200
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
+@pytest.mark.parametrize("url", READ_URLS)
 def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
     express_app, express_headers, monkeypatch, url
 ):
@@ -890,7 +1181,7 @@ def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
             if query in (
                 "SELECT COUNT(*) FROM players",
                 "SELECT * FROM players WHERE playerId COLLATE BINARY = ? LIMIT ?",
-            ) or query.startswith("SELECT COUNT(*) AS total,"):
+            ) or query.startswith(("SELECT COUNT(*) AS total,", "SELECT COUNT(*), COUNT(")):
                 query = (
                     "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL "
                     "SELECT i + 1 FROM n WHERE i < 10000000) SELECT SUM(i) FROM n"
@@ -916,6 +1207,10 @@ def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
         (PLAYERS_URL, {"q": "Hank"}, "search_players", PLAYERS_URL),
         (DETAIL_URL, None, "get_player", DETAIL_ROUTE),
         (STATISTICS_URL, {"q": "Hank"}, "get_player_statistics", STATISTICS_URL),
+        (
+            RANKINGS_URL, {"metric": "height", "q": "Hank"},
+            "rank_players", RANKINGS_URL,
+        ),
     ],
 )
 def test_success_logs_are_structured_without_player_or_query_data(
@@ -1022,6 +1317,103 @@ def test_statistics_group_query_failures_never_return_partial_results(
     assert event["result_count"] == 0
     assert "private statistics" not in response.get_data(as_text=True)
     assert "private statistics" not in caplog.text
+
+
+@pytest.mark.parametrize("metric", ["height", "weight", "birthYear"])
+@pytest.mark.parametrize("value", [float("inf"), -float("inf"), "private-value", b"private"])
+@pytest.mark.parametrize("offset", [0, 100000])
+def test_invalid_ranking_metrics_outside_the_page_still_fail_safely(
+    express_client, express_headers, player_db, caplog, metric, value, offset
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            f"UPDATE players SET {metric} = ? WHERE playerId = ?", (value, "unknown01")
+        )
+        conn.commit()
+
+    response = express_client.get(
+        RANKINGS_URL,
+        query_string={"metric": metric, "limit": "1", "offset": str(offset)},
+        headers=express_headers,
+    )
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    for sensitive in ("Infinity", "private", "unknown01"):
+        assert sensitive not in response.get_data(as_text=True)
+        assert sensitive not in caplog.text
+
+
+def test_invalid_ranking_metrics_outside_filters_do_not_block_valid_results(
+    express_client, express_headers, player_db, player_records, expected_rankings
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            "UPDATE players SET height = ? WHERE playerId = ?", ("invalid", "unknown01")
+        )
+        conn.commit()
+
+    response = express_client.get(
+        RANKINGS_URL,
+        query_string={"metric": "height", "q": "Aaron"},
+        headers=express_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_rankings(player_records[:2]),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("nameGiven", b"private-record"), ("weight", float("inf"))]
+)
+def test_unserializable_ranking_fields_never_return_partial_results(
+    express_client, express_headers, player_db, caplog, field, value
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            f"UPDATE players SET {field} = ? WHERE playerId = ?", (value, "aaronha01")
+        )
+        conn.commit()
+
+    response = express_client.get(HEIGHT_RANKINGS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    assert "private-record" not in caplog.text
+    assert "private-record" not in response.get_data(as_text=True)
+    assert "Infinity" not in response.get_data(as_text=True)
+
+
+def test_ranking_page_failure_never_returns_partial_metadata(
+    express_client, express_headers, monkeypatch, caplog
+):
+    connect = sqlite3.connect
+
+    class FailingPageConnection(sqlite3.Connection):
+        def execute(self, query, parameters=()):
+            if query.startswith("SELECT * FROM players WHERE height IS NOT NULL"):
+                raise sqlite3.OperationalError("private ranking page diagnostic")
+            return super().execute(query, parameters)
+
+    def failing_connect(*args, **kwargs):
+        return connect(*args, factory=FailingPageConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", failing_connect)
+    response = express_client.get(HEIGHT_RANKINGS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "OperationalError"
+    assert event["result_count"] == 0
+    assert "private ranking" not in caplog.text
+    assert "private ranking" not in response.get_data(as_text=True)
 
 
 def test_complete_seed_pagination_through_authenticated_http(
@@ -1135,6 +1527,108 @@ def test_filtered_seed_statistics_match_independent_csv_population(
         **expected_statistics(records, group_limit=1),
         "request_id": response.headers["X-Request-ID"],
     }
+
+
+@pytest.mark.parametrize(
+    ("metric", "missing"), [("height", 755), ("weight", 837), ("birthYear", 126)]
+)
+@pytest.mark.parametrize("direction", ["asc", "desc"])
+def test_complete_seed_rankings_through_authenticated_http(
+    express_client, express_headers, seed_player_records, expected_rankings,
+    metric, missing, direction
+):
+    assert len(seed_player_records) == 19370
+    numeric_columns = (
+        "birthYear", "birthMonth", "birthDay", "deathYear", "deathMonth", "deathDay",
+        "height", "weight",
+    )
+    records = [
+        {
+            column: (
+                float(value) if column in numeric_columns and value is not None else value
+            )
+            for column, value in record.items()
+        }
+        for record in seed_player_records
+    ]
+    expected = expected_rankings(records, metric, direction, limit=len(records))
+    expected_rows = expected["data"]
+    total = 19370 - missing
+    assert len(expected_rows) == total
+    received_ids = []
+    offset = 0
+    while offset is not None:
+        response = express_client.get(
+            RANKINGS_URL,
+            query_string={
+                "metric": metric, "direction": direction,
+                "limit": "100", "offset": str(offset),
+            },
+            headers=express_headers,
+        )
+        next_offset = offset + 100 if offset + 100 < total else None
+        assert response.status_code == 200
+        payload = response.get_json()
+        assert payload == {
+            "metric": metric,
+            "direction": direction,
+            "excluded_count": missing,
+            "data": expected_rows[offset : offset + 100],
+            "pagination": {
+                "limit": 100, "offset": offset, "total": total,
+                "next_offset": next_offset,
+            },
+            "request_id": response.headers["X-Request-ID"],
+        }
+        received_ids.extend(row["playerId"] for row in payload["data"])
+        offset = next_offset
+    assert received_ids == [row["playerId"] for row in expected_rows]
+    assert len(set(received_ids)) == total
+
+
+def test_filtered_seed_rankings_match_independent_csv_population(
+    express_client, express_headers, seed_player_records, expected_rankings
+):
+    records = [
+        record
+        for record in seed_player_records
+        if record["birthCountry"] == "USA"
+        and record["birthYear"] is not None
+        and 1930 <= float(record["birthYear"]) <= 1940
+        and record["bats"] == "R"
+        and record["throws"] == "R"
+    ]
+    assert len(records) > 100
+    expected = expected_rankings(records, "weight", "asc", limit=7, offset=10)
+
+    response = express_client.get(
+        RANKINGS_URL,
+        headers=express_headers,
+        query_string={
+            "metric": "weight",
+            "direction": "asc",
+            "birth_country": "USA",
+            "birth_year_min": "1930",
+            "birth_year_max": "1940",
+            "bats": "R",
+            "throws": "R",
+            "limit": "7",
+            "offset": "10",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["metric"] == "weight"
+    assert payload["direction"] == "asc"
+    assert payload["excluded_count"] == expected["excluded_count"]
+    assert payload["pagination"] == expected["pagination"]
+    assert [row["playerId"] for row in payload["data"]] == [
+        row["playerId"] for row in expected["data"]
+    ]
+    assert [row["weight"] for row in payload["data"]] == [
+        float(row["weight"]) for row in expected["data"]
+    ]
 
 
 def test_legacy_player_routes_stay_unauthenticated_and_unchanged(

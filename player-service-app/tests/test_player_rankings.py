@@ -12,34 +12,8 @@ def service(player_db):
     return PlayerService(player_db)
 
 
-def expected_rankings(records, metric="height", direction="desc", limit=20, offset=0):
-    known = [record for record in records if record[metric] is not None]
-    ordered = sorted(
-        known,
-        key=lambda record: (
-            float(record[metric]) * (-1 if direction == "desc" else 1),
-            record["playerId"],
-        ),
-    )
-    next_offset = offset + limit
-    return {
-        "metric": metric,
-        "direction": direction,
-        "excluded_count": len(records) - len(known),
-        "data": ordered[offset : offset + limit],
-        "pagination": {
-            "limit": limit,
-            "offset": offset,
-            "total": len(known),
-            "next_offset": (
-                next_offset if next_offset < len(known) and next_offset <= 100000 else None
-            ),
-        },
-    }
-
-
 def test_default_rankings_preserve_records_and_report_missing_values(
-    service, player_records
+    service, player_records, expected_rankings
 ):
     result = service.rank_players("height")
 
@@ -52,7 +26,9 @@ def test_default_rankings_preserve_records_and_report_missing_values(
 
 @pytest.mark.parametrize("metric", ["height", "weight", "birthYear"])
 @pytest.mark.parametrize("direction", ["asc", "desc"])
-def test_each_metric_supports_both_directions(service, player_records, metric, direction):
+def test_each_metric_supports_both_directions(
+    service, player_records, expected_rankings, metric, direction
+):
     assert service.rank_players(metric, direction=direction) == expected_rankings(
         player_records, metric, direction
     )
@@ -135,7 +111,7 @@ def test_ties_use_binary_player_id_order_across_pages(
     ],
 )
 def test_filters_apply_to_rankings_and_exclusions(
-    service, player_records, filters, record_indexes
+    service, player_records, expected_rankings, filters, record_indexes
 ):
     records = [player_records[index] for index in record_indexes]
 
@@ -146,7 +122,9 @@ def test_filters_apply_to_rankings_and_exclusions(
 
 
 @pytest.mark.parametrize("q", ["%", "_", "\\"])
-def test_ranking_search_treats_wildcards_literally(service, player_db, player_records, q):
+def test_ranking_search_treats_wildcards_literally(
+    service, player_db, player_records, expected_rankings, q
+):
     record = {**player_records[1], "nameGiven": r"Marker\%_value"}
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute(
@@ -163,14 +141,16 @@ def test_ranking_search_treats_wildcards_literally(service, player_db, player_re
     [(1, 0), (1, 1), (2, 0), (2, 1), (100, 0), (20, 2), (20, 100000)],
 )
 def test_page_totals_and_exclusions_do_not_depend_on_page(
-    service, player_records, limit, offset
+    service, player_records, expected_rankings, limit, offset
 ):
     assert service.rank_players("height", limit=limit, offset=offset) == expected_rankings(
         player_records, limit=limit, offset=offset
     )
 
 
-def test_empty_population_returns_an_explicit_empty_page(service, player_db):
+def test_empty_population_returns_an_explicit_empty_page(
+    service, player_db, expected_rankings
+):
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute("DELETE FROM players")
         conn.commit()
@@ -341,7 +321,7 @@ def test_invalid_metrics_anywhere_in_population_raise(
 
 
 def test_invalid_metrics_outside_filtered_population_do_not_block_rankings(
-    service, player_db, player_records
+    service, player_db, player_records, expected_rankings
 ):
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute(
@@ -355,7 +335,7 @@ def test_invalid_metrics_outside_filtered_population_do_not_block_rankings(
 
 
 def test_counts_validation_and_page_share_one_snapshot(
-    service, player_db, player_records, monkeypatch
+    service, player_db, player_records, monkeypatch, expected_rankings
 ):
     with closing(sqlite3.connect(player_db)) as conn:
         assert conn.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
@@ -451,7 +431,9 @@ def test_next_offset_never_exceeds_supported_cap(service, player_db):
     assert crossing_page["pagination"]["next_offset"] is None
 
 
-def assert_complete_rankings(service, records, metric, direction, filters=None):
+def assert_complete_rankings(
+    service, records, metric, direction, expected_rankings, filters=None
+):
     expected = expected_rankings(records, metric, direction, limit=len(records))
     expected_rows = expected["data"]
     actual_ids = []
@@ -492,15 +474,19 @@ def assert_complete_rankings(service, records, metric, direction, filters=None):
 )
 @pytest.mark.parametrize("direction", ["asc", "desc"])
 def test_complete_repository_seed_rankings(
-    service, seed_player_records, metric, missing, direction
+    service, seed_player_records, expected_rankings, metric, missing, direction
 ):
     assert len(seed_player_records) == 19370
     assert sum(record[metric] is None for record in seed_player_records) == missing
 
-    assert_complete_rankings(service, seed_player_records, metric, direction)
+    assert_complete_rankings(
+        service, seed_player_records, metric, direction, expected_rankings
+    )
 
 
-def test_filtered_seed_rankings_match_independent_population(service, seed_player_records):
+def test_filtered_seed_rankings_match_independent_population(
+    service, seed_player_records, expected_rankings
+):
     records = [
         record
         for record in seed_player_records
@@ -517,6 +503,7 @@ def test_filtered_seed_rankings_match_independent_population(service, seed_playe
         records,
         "height",
         "desc",
+        expected_rankings,
         PlayerFilters(
             birth_country="USA",
             birth_year_min=1930,

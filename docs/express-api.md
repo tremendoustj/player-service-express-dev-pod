@@ -1,9 +1,9 @@
-# Express integration API: authenticated search, details, and statistics
+# Express integration API: authenticated reads and analytics
 
-**Status: opt-in search/filter, player-detail, and population-statistics endpoints
-are implemented and locally tested.** Rankings, comparisons, and the OpenAPI
-contract are not yet exposed through this API. The remaining service methods
-already exist.
+**Status: opt-in search/filter, player-detail, population-statistics, and numeric
+ranking endpoints are implemented and locally tested.** Comparisons and the
+OpenAPI contract are not yet exposed through this API. The comparison service
+method already exists.
 Metrics, production packaging, real loopback HTTP smoke tests, and authenticated
 Express/Nexla validation remain pending.
 
@@ -258,6 +258,68 @@ group values produce 503 `storage_unavailable`. A failed group query never
 returns a partial summary. Deadline cancellation produces 504 `query_timeout`;
 connections close on success and failure.
 
+## Numeric rankings
+
+`GET /integrations/express/v1/rankings` orders players by a supported numeric
+attribute, for example
+`/integrations/express/v1/rankings?metric=height&birth_country=USA&limit=5`.
+It uses the same bearer authentication, query-size/body restrictions, SQLite
+deadlines, correlation headers, and no-store policy as search.
+
+| Query parameter | Semantics |
+| --- | --- |
+| `metric` | **Required.** Exactly `height`, `weight`, or `birthYear`, case-sensitive. There is no default or support for performance statistics, player quality, or computed age. |
+| `direction` | Exactly `asc` or `desc`, default `desc`. |
+| `q`, `birth_country`, `birth_year_min`, `birth_year_max`, `bats`, `throws` | The same optional, AND-combined [search filters](#search-and-filtering), with identical validation, literal text matching, and null behavior. |
+| `limit` | 1-100, default 20. Caps the page size, not the population being ranked. |
+| `offset` | 0-100000, default 0. |
+
+Only these ten scalar parameters are accepted, each at most once. Enum values
+are not trimmed or case-normalized; integer values use the same canonical
+unsigned ASCII decimal notation as search. Missing/invalid metrics, invalid
+directions or filters, unknown/duplicate parameters, malformed encoding, and
+out-of-range pages return 400 **before any database access**, including schema
+inspection. `group_limit`, arbitrary ordering/grouping fields, and SQL are not
+accepted. HEAD performs the same validated read without a response body;
+authenticated automatic OPTIONS performs no database read.
+
+A successful response contains exactly:
+
+| Response field | Contents |
+| --- | --- |
+| `metric`, `direction` | The selected metric and direction, including the default direction. |
+| `data` | A bounded array of full stored records with the same 24 field names, types, and nullable values as search. Records with a null selected metric are excluded. |
+| `pagination` | `limit`, `offset`, `total`, and nullable `next_offset`. The total counts every **rankable** player in the filtered population, not just this page. |
+| `excluded_count` | Number of players in the entire filtered population with a null selected metric, independently of the page. |
+| `request_id` | The same correlation identifier as the `X-Request-ID` response header. |
+
+Ordering is numeric by the selected metric, then `playerId` **ascending using
+binary collation in both directions**. Ties are stable across pages for unchanged
+data with unique IDs. No competition/dense rank numbers are assigned. Zero and
+fractional values remain known measurements; null is never ranked as zero.
+No measurement-unit, freshness, performance, or player-quality claims are added.
+
+`pagination.total + excluded_count` equals the full filtered population size.
+Empty populations return HTTP 200 with no rows, zero total, and zero exclusions.
+All-null populations also return HTTP 200 with no rows and zero rankable total,
+but report every matching player as excluded. Pages beyond the end retain these
+full counts. The same [pagination window](#search-and-filtering) applies as in
+search: a null `next_offset` can mean the 100000 offset cap was reached, not that
+all rankable rows were returned. Narrow filters when the window is insufficient.
+
+`PlayerService.rank_players()` validates, counts, and selects the page within one
+read-only transaction and shared operation deadline. Schema inspection has its
+own deadline; neither is a hard total HTTP timeout. Separate page requests do not
+promise a consistent revision during a database refresh.
+
+Nonnumeric or infinite values of the selected metric **anywhere in the filtered
+population** produce 503 `storage_unavailable`, even when the requested page
+would be empty or omit the invalid row. Invalid metric values outside the
+filters do not block valid results. Returned nonfinite/unserializable fields,
+including attributes other than the selected metric, also produce 503, never
+partial rows or successful nonstandard JSON. Deadline cancellation produces
+504 `query_timeout`; connections close on success and failure.
+
 ## Errors and correlation
 
 All integration JSON errors use this envelope:
@@ -276,11 +338,11 @@ All integration JSON errors use this envelope:
 | --- | --- | --- |
 | 400 | `invalid_request` | Invalid, ambiguous, or unsupported input, including a GET/HEAD body. |
 | 401 | `unauthorized` | Missing, malformed, or incorrect application credential. |
-| 404 | `not_found` | No implemented route at this URL; `/rankings` and `/comparisons` remain unavailable. |
+| 404 | `not_found` | No implemented route at this URL; `/comparisons` remains unavailable. |
 | 404 | `player_not_found` | The well-formed requested player ID does not exist. |
 | 405 | `method_not_allowed` | Unsupported method; the response preserves the `Allow` header. |
 | 414 | `request_too_large` | Encoded query string exceeds 4096 bytes. |
-| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values, invalid/overflowing numeric aggregates, or duplicate selected detail IDs. |
+| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values, invalid/overflowing numeric aggregates, invalid stored ranking metrics, or duplicate selected detail IDs. |
 | 504 | `query_timeout` | Database read deadline exceeded. |
 | 500 | `internal_error` | Unexpected failure, with sanitized diagnostics in the request log. |
 
@@ -302,6 +364,8 @@ path. Detail requests log a fixed route template, not the player ID, and report
 one result on success or zero on failure. Statistics log the **full matched
 population** as `result_count`, not the number of returned categories; failures
 report zero, including failures after some aggregates have been computed.
+Rankings log the number of **returned page rows**, not the rankable total or
+excluded count, and report zero on failure.
 Tokens, request/query/body contents,
 player records, SQL, and exception messages/tracebacks are excluded. Successes
 use INFO and failures use WARNING
@@ -325,6 +389,9 @@ Express user's identity in Flask.
 Statistics return an aggregate envelope, not rows at `$.data`. Do not reuse the
 search response-extraction path for this operation: preserve `total`, `numeric`,
 `groups`, and correlation metadata when reviewing its generated tool binding.
+Rankings do have rows at `$.data`, but their generated tools must also preserve
+`metric`, `direction`, `excluded_count`, pagination, and correlation metadata.
+Dropping that metadata can hide excluded players or an incomplete traversal.
 
 This is a supported header-credential mechanism, not evidence that MCP Studio
 has discovered or bound the endpoint. There is no documented arbitrary Express
@@ -340,7 +407,7 @@ source player-service-app/.venv/bin/activate
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
 
-The complete local suite passes **970 tests**. Coverage includes disabled/invalid
+The complete local suite passes **1155 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
@@ -353,5 +420,11 @@ Ollama success/failure behavior are retained. Statistics coverage verifies all
 shared filters, exact group-limit bounds over 101 categories, empty/all-null
 populations, rejected pagination, nonfinite/overflowing aggregates, safe group
 failures, redacted logs, and independent full-seed and filtered-seed expectations.
+Ranking coverage checks every metric/direction, required enums before schema
+reads, all ten inputs together, exact page/offset bounds, binary ties, exclusions,
+empty/all-null populations, off-page invalid metrics, and page/serialization
+failures. Complete HTTP pagination in all six metric/direction combinations
+matches independent CSV-derived records across the **19,370-player** population:
+18,615 rankable heights, 18,533 weights, and 19,244 birth years.
 Flask test-client coverage is not
 a real network, container, live Ollama, or Express/Nexla end-to-end result.
