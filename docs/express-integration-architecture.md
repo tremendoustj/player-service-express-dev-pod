@@ -2,10 +2,13 @@
 
 Assessment date: 2026-11-02.
 
-**Status: design only.** No integration endpoints, authentication, observability,
-or MCP server have been implemented in this iteration. No infrastructure was
-deployed and no Nexla resources were created. This document distinguishes the
-existing application, verified platform capabilities, and proposed changes.
+**Status: shared data-access prerequisite implemented; Express integration pending.**
+Player/country lookups are parameterized, reads explicitly close their read-only
+SQLite connections, and missing-player handling has regression coverage. No
+integration endpoints, authentication, observability, or MCP server are implemented
+yet. No infrastructure was deployed and no Nexla resources were created. This
+document distinguishes the existing application, verified platform capabilities,
+and proposed changes.
 
 ## 1. Repository assessment
 
@@ -18,19 +21,20 @@ recommendation service in `player-service-model`.
 | Existing surface | Actual behavior | Integration implication |
 | --- | --- | --- |
 | `GET /v1/players` | Returns a bare JSON array of every player through `PlayerService.get_all_players()`. No search, filters, sorting contract, or pagination. | Preserve this response; add a separate bounded integration API. |
-| `GET /v1/players/<player_id>` | Returns a single player dictionary. The route intends to return an error object with HTTP 200 when absent, but `search_by_player()` references an unassigned `dic` for no matches. | Repair the lookup with regression tests, preserve successful legacy responses, and define a separate 404 contract for new tools. |
+| `GET /v1/players/<player_id>` | Returns a single player dictionary, or the intended error object with HTTP 200 when absent. The unassigned-variable failure for absent IDs was repaired in increment 2. | Preserve the legacy responses and define a separate 404 contract for new tools. |
 | `GET /v1/chat/list-models` | Calls `ollama.list()`; exceptions produce a JSON error with HTTP 503. | Keep independent of the integration. |
 | `POST /v1/chat` | Calls TinyLlama with the hard-coded question "Why is the sky blue?"; it does not use a client prompt or query player data. Exceptions produce HTTP 503. | This is not an existing player-question-answering engine. Do not route player tools through it. |
 | `PlayerService.search_by_country()` | Unrouted service method returning raw SQLite rows. | Reuse the country-filter concept, not its raw output as a public tool contract. |
 
-[`player_service.py`](../player-service-app/player_service.py) currently
-interpolates player IDs and countries into SQL and does not explicitly close its
-connections. These are prerequisites to address before exposing new tools.
-There is no application authentication, validation layer, request correlation,
+[`player_service.py`](../player-service-app/player_service.py) now binds player IDs
+and countries as SQL parameters and explicitly closes each read-only connection.
+The initial assessment found interpolated lookups and unclosed connections; the
+safe shared data-access increment below addresses those prerequisites.
+There is still no application authentication, validation layer, request correlation,
 structured logging, operational metrics, or explicit request/query deadline.
 The development entry point binds port 8000 on all interfaces with debug enabled.
-These observations come from source inspection; this assessment did not execute
-live Ollama requests or the missing-player error path.
+Live Ollama requests remain unverified; the missing-player error path now has
+local Flask test-client coverage.
 
 ### SQLite and available data
 
@@ -92,7 +96,7 @@ the model's 8657. Do not treat that setup as a verified production deployment.
 
 ### Test baseline
 
-The only tracked automated test is
+At the initial assessment, the only tracked automated test was
 [`tests/test_app.py`](../player-service-app/tests/test_app.py), which checks that
 `GET /v1/players` returns a nonempty array containing `playerId`.
 `pytest.ini` supplies the application import path. There is no configured linter,
@@ -112,9 +116,46 @@ player-service-app/.venv/bin/python -m pytest -c player-service-app/pytest.ini p
 ```
 
 `uv` is not a new application requirement. A conventional compatible virtual
-environment can run the same suite. The current test imports the application and
-creates the ignored database when absent; future query tests must use isolated
+environment can run the same suite. The original test imported the application
+and created the ignored database when absent. Increment 2 redirects the database
+path before importing Flask in its test fixture, so the suite now uses isolated
 temporary databases instead.
+
+### Safe shared data access (increment 2)
+
+`PlayerService` now accepts an optional filesystem `db_path`, retaining the
+application-relative default. Each query opens an existing database using an
+escaped file URI with `mode=ro`, enables `PRAGMA query_only`, materializes its
+results, and explicitly closes the connection using `contextlib.closing`.
+Connection cleanup also applies when SQLite raises an error; a missing file is
+not silently created by a service read. The application's existing
+`ensure_player_db()` startup initialization is unchanged.
+
+Player and country inputs are bound parameters, not SQL fragments. All stored
+fields, nullable values, and legacy return shapes are retained: lists of
+dictionaries for player listings, a dictionary for a detail result, and tuples
+for the unrouted country lookup. An absent player returns `{}` from the service,
+allowing the unchanged legacy route to return its intended
+`{"error": "No record found with player_id=..."}` with HTTP 200. This is not the
+future integration API's proposed 404 contract. Storage failures still raise;
+they are not converted into empty successful results.
+
+The local suite now has **29 passing tests** covering exact legacy responses,
+all 24 fields, nullable records, quote-containing/Unicode values, SQL-shaped
+inputs, empty/missing results, read-only enforcement, missing/corrupt storage,
+URI-sensitive filesystem names, and connection cleanup on success and failure.
+Both service and Flask tests use temporary SQLite fixtures; no Ollama or Express
+connectivity is required or established by these tests.
+
+Run the complete suite with the existing compatible virtual environment:
+
+```shell
+source player-service-app/.venv/bin/activate
+python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
+```
+
+Bounded query operations, integration authentication/validation, configurable
+deadlines, observability, and production packaging remain future increments.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -301,16 +342,16 @@ or document and validate a deliberate compatibility decision.
 | Increment | Individually verifiable completion gate |
 | --- | --- |
 | Assessment (this document) | Repository/data inventory, official-source decision, and existing pytest baseline recorded. No runtime behavior changed. |
-| Safe shared data access (**next smallest unit**) | Parameterized player/country lookups, deterministic no-match behavior, explicit connection cleanup, and temporary-database tests. Existing list/detail response contracts retained; regression tests cover quote-containing input and intended legacy missing-ID error behavior. |
-| Bounded player query capabilities | Fixture-backed tests for search/filter, full-population aggregates, nulls, switch handedness, stable rankings/ties, comparisons, and exact pagination boundaries. Shared query methods, not duplicated business logic. |
+| Safe shared data access (**complete**) | Parameterized player/country lookups, deterministic no-match behavior, read-only connections with explicit cleanup, and temporary-database tests. Existing list/detail response contracts retained; regression tests cover quote-containing input and intended legacy missing-ID error behavior. |
+| Bounded player query capabilities (**next increment**) | Fixture-backed tests for search/filter, full-population aggregates, nulls, switch handedness, stable rankings/ties, comparisons, and exact pagination boundaries. Shared query methods, not duplicated business logic. |
 | Authenticated integration API and schema | Opt-in routes, fail-closed configuration, strict validation, deadlines, safe errors, and OpenAPI contract tests. Flask test-client tests cover all operations, unauthorized calls, malformed inputs, unavailable/locked storage, and unchanged legacy/Ollama routes (Ollama mocked). |
 | Observability | Correlation IDs across success/failure, redacted structured logs, bounded metrics labels, and counter/latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
 | Express/Nexla validation | Operator-approved, authenticated Studio/connector setup; review generated contracts and call every capability, inspect receipts, and compare with local expected results. If a custom MCP adapter is necessary, add and verify it before claiming this gate. Otherwise document exact outstanding external blockers. |
 
 Every implementation increment must update the relevant documentation and run
-its focused tests plus the existing regression suite. No formatter/linter
-installation is needed just for this documentation increment. Live Ollama or
+its focused tests plus the existing regression suite. No application formatter or
+linter is currently configured. Live Ollama or
 model-container tests are not prerequisites for deterministic player queries;
 mocked chat tests are not evidence of live model integration.
 
@@ -363,10 +404,10 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline test result above is
-only local Flask coverage, not an Express, Nexla, MCP, Docker, or live Ollama
-integration success. Implementation work remains in addition to the external
-items; documenting blockers does not make the implementation complete.
+**End-to-end integration is not complete.** The baseline and increment-2 test
+results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
+or live Ollama integration success. Implementation work remains in addition to
+the external items; documenting blockers does not make the implementation complete.
 
 ## Official references
 

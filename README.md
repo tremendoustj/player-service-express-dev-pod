@@ -2,12 +2,15 @@
 
 Player Service is a backend application that serves baseball player data. In addition, Player service integrates with [Ollama](https://github.com/ollama/ollama/blob/main/docs/api.md), which allows us to run the [tinyllama LLM]((https://ollama.com/library/tinyllama)) locally.
 
-## Express.dev integration (planned)
+## Express.dev integration (in progress)
 
 The [architecture assessment and implementation plan](docs/express-integration-architecture.md)
 evaluates REST and MCP integration with Express.dev/Nexla, defines the proposed
 read-only player tools, and records the test baseline and external validation
-requirements. The integration is not implemented yet; existing APIs are unchanged.
+requirements. Shared SQLite reads are now parameterized, read-only, and explicitly
+closed, with isolated regression coverage and deterministic missing-player handling.
+Express-facing endpoints are not implemented yet; existing successful API response
+formats are unchanged.
 
 ## Dependencies
 

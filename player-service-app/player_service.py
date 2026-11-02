@@ -1,47 +1,41 @@
 import sqlite3
+from contextlib import closing
+from pathlib import Path
 
 from app_paths import PLAYER_DB
 
 
 class PlayerService:
-    def __init__(self):
-        conn = sqlite3.connect(PLAYER_DB)
-        self.conn = conn
-        self.cursor = conn.cursor()
+    def __init__(self, db_path=None):
+        self.db_path = Path(PLAYER_DB if db_path is None else db_path).resolve()
         self.columns = self.get_columns()
 
+    def _fetchall(self, query, parameters=()):
+        with closing(
+            sqlite3.connect(f"{self.db_path.as_uri()}?mode=ro", uri=True)
+        ) as conn:
+            conn.execute("PRAGMA query_only = ON")
+            return conn.execute(query, parameters).fetchall()
+
     def get_all_players(self):
-
-        query = "SELECT * FROM players"
-        result = self.cursor.execute(query).fetchall()
-        players = []
-        for row in result:
-            dic = self.convert_row_to_dict(row)
-            players.append(dic)
-
-        return players
+        result = self._fetchall("SELECT * FROM players")
+        return [self.convert_row_to_dict(row) for row in result]
 
     def search_by_player(self, player_id):
-
-        query = "SELECT * FROM players WHERE playerId='{}'".format(player_id)
-        result = self.cursor.execute(query).fetchall()
-
-        for row in result:
-            dic = self.convert_row_to_dict(row)
-        return dic
+        result = self._fetchall(
+            "SELECT * FROM players WHERE playerId = ?", (player_id,)
+        )
+        return self.convert_row_to_dict(result[-1]) if result else {}
 
     def search_by_country(self, birth_country):
-
-        query = "SELECT * FROM players WHERE birthCountry='{}'".format(birth_country)
-        result = self.cursor.execute(query).fetchall()
-
-        return result
+        return self._fetchall(
+            "SELECT * FROM players WHERE birthCountry = ?", (birth_country,)
+        )
 
     def convert_row_to_dict(self, row):
         dic = {self.columns[i]: row[i] for i in range(len(row))}
         return dic
 
     def get_columns(self):
-        self.cursor.execute("PRAGMA table_info(players)")
-        columns = [column[1] for column in self.cursor.fetchall()]
+        columns = [column[1] for column in self._fetchall("PRAGMA table_info(players)")]
         return columns
