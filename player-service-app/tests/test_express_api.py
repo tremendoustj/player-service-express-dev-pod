@@ -16,6 +16,7 @@ from player_service import PlayerQueryTimeoutError, PlayerService
 PLAYERS_URL = API_PREFIX + "/players"
 DETAIL_URL = PLAYERS_URL + "/aaronha01"
 DETAIL_ROUTE = PLAYERS_URL + "/<string:player_id>"
+STATISTICS_URL = API_PREFIX + "/statistics"
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +42,10 @@ def assert_error(response, status, code):
 
 @pytest.mark.parametrize(
     "path",
-    [API_PREFIX, PLAYERS_URL, DETAIL_URL, PLAYERS_URL + "/bad-id", API_PREFIX + "/unknown"],
+    [
+        API_PREFIX, PLAYERS_URL, DETAIL_URL, STATISTICS_URL,
+        PLAYERS_URL + "/bad-id", API_PREFIX + "/unknown",
+    ],
 )
 @pytest.mark.parametrize("method", ["GET", "OPTIONS", "POST", "DELETE"])
 def test_authentication_precedes_routing_and_validation(
@@ -360,6 +364,181 @@ def test_integer_boundaries(
 
 
 @pytest.mark.parametrize(
+    ("query", "indexes"),
+    [
+        ({}, [0, 1, 2, 3]),
+        ({"group_limit": "1"}, [0, 1, 2, 3]),
+        ({"q": "AARON"}, [0, 1]),
+        ({"q": "Henry Louis"}, [0]),
+        ({"q": "ren\u00e9"}, [2]),
+        ({"q": "REN\u00c9"}, []),
+        ({"q": "unknown01"}, [3]),
+        ({"q": "' OR 1=1 --"}, []),
+        ({"q": "%"}, []),
+        ({"q": "_"}, []),
+        ({"q": "\\"}, []),
+        ({"birth_country": "C\u00f4te d'Ivoire"}, [2]),
+        ({"birth_country": "usa"}, []),
+        ({"birth_country": "USA' OR 1=1 --"}, []),
+        ({"birth_year_min": "1939"}, [1]),
+        ({"birth_year_max": "1934"}, [0]),
+        ({"birth_year_min": "1", "birth_year_max": "9999"}, [0, 1]),
+        ({"bats": "B"}, [2]),
+        ({"throws": "S"}, [2]),
+        ({"q": "x" * 100, "birth_country": "x" * 100}, []),
+        (
+            {
+                "q": "Aaron",
+                "birth_country": "USA",
+                "birth_year_min": "1934",
+                "birth_year_max": "1939",
+                "bats": "R",
+                "throws": "R",
+                "group_limit": "1",
+            },
+            [0, 1],
+        ),
+    ],
+)
+def test_statistics_response_preserves_filters_nulls_and_population_counts(
+    express_client, express_headers, player_records, expected_statistics,
+    caplog, query, indexes
+):
+    caplog.set_level(logging.INFO)
+    response = express_client.get(
+        STATISTICS_URL,
+        query_string=query,
+        headers={**express_headers, "X-Request-ID": "statistics-123"},
+    )
+    expected = expected_statistics(
+        [player_records[index] for index in indexes], int(query.get("group_limit", "20"))
+    )
+
+    assert response.status_code == 200
+    assert response.is_json
+    assert response.get_json() == {**expected, "request_id": "statistics-123"}
+    assert response.headers["X-Request-ID"] == "statistics-123"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["operation"] == "express_integration.get_player_statistics"
+    assert event["result_count"] == len(indexes)
+
+
+def test_statistics_accepts_percent_encoded_parameters(
+    express_client, express_headers, player_records, expected_statistics
+):
+    response = express_client.get(
+        STATISTICS_URL + "?%67roup_limit=%31&birth_country=C%C3%B4te+d%27Ivoire",
+        headers=express_headers,
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_statistics([player_records[2]], group_limit=1),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize("group_limit", [None, 1, 100])
+def test_statistics_group_limit_bounds_output_not_the_population(
+    express_client, express_headers, player_db, player_records,
+    expected_statistics, group_limit
+):
+    records = [
+        {**dict.fromkeys(player_records[0]), "birthCountry": f"C{index:03d}"}
+        for index in reversed(range(101))
+    ]
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.executemany(
+            "INSERT INTO players (birthCountry) VALUES (?)",
+            [(record["birthCountry"],) for record in records],
+        )
+        conn.commit()
+    query = {} if group_limit is None else {"group_limit": str(group_limit)}
+
+    response = express_client.get(
+        STATISTICS_URL, query_string=query, headers=express_headers
+    )
+
+    assert response.status_code == 200
+    limit = 20 if group_limit is None else group_limit
+    payload = response.get_json()
+    assert payload == {
+        **expected_statistics(records, group_limit=limit),
+        "request_id": response.headers["X-Request-ID"],
+    }
+    assert payload["total"] == 101
+    countries = payload["groups"]["birthCountry"]
+    assert len(countries["data"]) == limit
+    assert countries["total_groups"] == 101
+    assert countries["other_count"] == 101 - limit
+
+
+def test_statistics_empty_database_is_a_successful_empty_population(
+    express_client, express_headers, player_db, expected_statistics
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.commit()
+
+    response = express_client.get(STATISTICS_URL, headers=express_headers)
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_statistics([]),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "group_limit=0",
+        "group_limit=101",
+        "group_limit=-1",
+        "group_limit=%2B1",
+        "group_limit=%201",
+        "group_limit=1%20",
+        "group_limit=1.0",
+        "group_limit=1e1",
+        "group_limit=01",
+        "group_limit=00",
+        "group_limit=1000000",
+        "group_limit=%EF%BC%91",
+        "group_limit=true",
+        "group_limit=null",
+        "group_limit=",
+        "group_limit=1&group_limit=2",
+        "group_limit=1&%67roup_limit=2",
+        "group_limit[]=1",
+        "limit=1",
+        "offset=0",
+        "metric=height",
+        "direction=asc",
+        "&".join("q=a" for _ in range(8)),
+    ],
+)
+def test_invalid_statistics_arguments_fail_before_any_database_access(
+    express_client, express_headers, tracked_connections, query
+):
+    response = express_client.get(STATISTICS_URL + "?" + query, headers=express_headers)
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+def test_search_does_not_accept_statistics_parameters(
+    express_client, express_headers, tracked_connections
+):
+    response = express_client.get(PLAYERS_URL + "?group_limit=1", headers=express_headers)
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+@pytest.mark.parametrize(
     "query",
     [
         "unknown=secret",
@@ -403,11 +582,12 @@ def test_integer_boundaries(
         "&".join("q=a" for _ in range(9)),
     ],
 )
+@pytest.mark.parametrize("url", [PLAYERS_URL, STATISTICS_URL])
 def test_invalid_inputs_fail_before_any_database_read(
-    express_client, express_headers, tracked_connections, query
+    express_client, express_headers, tracked_connections, query, url
 ):
     response = express_client.get(
-        PLAYERS_URL + "?" + query, headers=express_headers
+        url + "?" + query, headers=express_headers
     )
     assert_error(response, 400, "invalid_request")
     assert tracked_connections == []
@@ -420,7 +600,7 @@ def test_invalid_inputs_fail_before_any_database_read(
         (MAX_QUERY_STRING_BYTES + 1, 414, "request_too_large"),
     ],
 )
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_exact_query_string_size_boundary(
     express_client, express_headers, tracked_connections, size, status, code, url
 ):
@@ -442,7 +622,7 @@ def test_request_size_is_checked_after_authentication(
 
 
 @pytest.mark.parametrize("input_terminated", [False, True])
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_request_bodies_are_rejected_without_reading_them(
     express_client, express_headers, tracked_connections, input_terminated, url
 ):
@@ -467,7 +647,7 @@ def test_request_bodies_are_rejected_without_reading_them(
 
 
 @pytest.mark.parametrize("input_terminated", [False, True])
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_transfer_encoded_bodies_are_rejected(
     express_client, express_headers, tracked_connections, input_terminated, url
 ):
@@ -540,6 +720,9 @@ def test_unsafe_request_ids_are_replaced(
         (PLAYERS_URL, "DELETE", 405, "method_not_allowed"),
         (DETAIL_URL, "POST", 405, "method_not_allowed"),
         (DETAIL_URL, "DELETE", 405, "method_not_allowed"),
+        (STATISTICS_URL, "POST", 405, "method_not_allowed"),
+        (STATISTICS_URL, "DELETE", 405, "method_not_allowed"),
+        (STATISTICS_URL + "/", "GET", 404, "not_found"),
     ],
 )
 def test_routing_errors_are_correlated_and_do_not_query(
@@ -552,7 +735,7 @@ def test_routing_errors_are_correlated_and_do_not_query(
     assert tracked_connections == []
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_head_and_options_require_authentication(
     express_client, express_headers, tracked_connections, url
 ):
@@ -580,7 +763,7 @@ def test_head_and_options_require_authentication(
         ),
     ],
 )
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_http_reads_use_configured_deadlines(
     express_app, express_headers, monkeypatch, overrides, expected, url
 ):
@@ -607,6 +790,10 @@ def test_http_reads_use_configured_deadlines(
     [
         (PLAYERS_URL, "search_players", {"q": "sensitive-search"}, PLAYERS_URL),
         (PLAYERS_URL + "/sensitiveplayer", "get_player", None, DETAIL_ROUTE),
+        (
+            STATISTICS_URL, "get_player_statistics",
+            {"q": "sensitive-search"}, STATISTICS_URL,
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -649,7 +836,7 @@ def test_safe_error_mapping_and_redacted_failure_logs(
         assert sensitive not in response.get_data(as_text=True)
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_missing_storage_returns_503_without_recreating_it(
     express_client, express_headers, player_db, url
 ):
@@ -660,7 +847,7 @@ def test_missing_storage_returns_503_without_recreating_it(
 
 
 @pytest.mark.parametrize("invalid", [float("inf"), -float("inf"), b"not-json"])
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_invalid_stored_json_never_becomes_a_successful_response(
     express_client, express_headers, player_db, invalid, url
 ):
@@ -673,7 +860,7 @@ def test_invalid_stored_json_never_becomes_a_successful_response(
     assert "not-json" not in response.get_data(as_text=True)
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_real_lock_exhaustion_is_503_and_releases_connections(
     express_app, express_headers, player_db, monkeypatch, url
 ):
@@ -690,7 +877,7 @@ def test_real_lock_exhaustion_is_503_and_releases_connections(
         assert client.get(url, headers=express_headers).status_code == 200
 
 
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL])
 def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
     express_app, express_headers, monkeypatch, url
 ):
@@ -703,7 +890,7 @@ def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
             if query in (
                 "SELECT COUNT(*) FROM players",
                 "SELECT * FROM players WHERE playerId COLLATE BINARY = ? LIMIT ?",
-            ):
+            ) or query.startswith("SELECT COUNT(*) AS total,"):
                 query = (
                     "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL "
                     "SELECT i + 1 FROM n WHERE i < 10000000) SELECT SUM(i) FROM n"
@@ -728,6 +915,7 @@ def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
     [
         (PLAYERS_URL, {"q": "Hank"}, "search_players", PLAYERS_URL),
         (DETAIL_URL, None, "get_player", DETAIL_ROUTE),
+        (STATISTICS_URL, {"q": "Hank"}, "get_player_statistics", STATISTICS_URL),
     ],
 )
 def test_success_logs_are_structured_without_player_or_query_data(
@@ -768,6 +956,72 @@ def test_unmatched_routes_and_auth_failures_do_not_log_raw_inputs(
     assert event["error_code"] == "unauthorized"
     for sensitive in ("sensitive-path", "unsafe request identifier", express_token):
         assert sensitive not in caplog.text
+
+
+@pytest.mark.parametrize("value", ["not-numeric", 1e308])
+def test_invalid_statistics_aggregates_never_become_successful_json(
+    express_client, express_headers, player_db, caplog, value
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("UPDATE players SET height = ?", (value,))
+        conn.commit()
+
+    response = express_client.get(STATISTICS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    assert "Infinity" not in response.get_data(as_text=True)
+    assert "not-numeric" not in response.get_data(as_text=True)
+    assert "not-numeric" not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["birthCountry", "bats", "throws"])
+def test_unserializable_statistics_groups_never_return_partial_results(
+    express_client, express_headers, player_db, caplog, field
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            f"UPDATE players SET {field} = ? WHERE playerId = ?",
+            (b"private-category", "aaronha01"),
+        )
+        conn.commit()
+
+    response = express_client.get(STATISTICS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    assert "private-category" not in response.get_data(as_text=True)
+    assert "private-category" not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["birthCountry", "bats", "throws"])
+def test_statistics_group_query_failures_never_return_partial_results(
+    express_client, express_headers, monkeypatch, caplog, field
+):
+    connect = sqlite3.connect
+
+    class FailingGroupConnection(sqlite3.Connection):
+        def execute(self, query, parameters=()):
+            if query.startswith(f"SELECT {field} AS value"):
+                raise sqlite3.OperationalError("private statistics group diagnostic")
+            return super().execute(query, parameters)
+
+    def failing_connect(*args, **kwargs):
+        return connect(*args, factory=FailingGroupConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", failing_connect)
+    response = express_client.get(STATISTICS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "OperationalError"
+    assert event["result_count"] == 0
+    assert "private statistics" not in response.get_data(as_text=True)
+    assert "private statistics" not in caplog.text
 
 
 def test_complete_seed_pagination_through_authenticated_http(
@@ -823,6 +1077,64 @@ def test_seed_details_match_independent_csv_records(
         )
         assert response.status_code == 200
         assert response.get_json()["data"] == expected
+
+
+@pytest.mark.parametrize("group_limit", [None, 1, 100])
+def test_seed_statistics_match_independent_csv_aggregates(
+    express_client, express_headers, seed_player_records, expected_statistics, group_limit
+):
+    query = {} if group_limit is None else {"group_limit": str(group_limit)}
+    response = express_client.get(
+        STATISTICS_URL, query_string=query, headers=express_headers
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {
+        **expected_statistics(
+            seed_player_records, 20 if group_limit is None else group_limit
+        ),
+        "request_id": response.headers["X-Request-ID"],
+    }
+    assert payload["total"] == 19370
+    assert payload["numeric"]["birthYear"]["missing_count"] == 126
+    assert payload["numeric"]["height"]["missing_count"] == 755
+    assert payload["numeric"]["weight"]["missing_count"] == 837
+    assert payload["groups"]["birthCountry"]["total_groups"] == 55
+    assert payload["groups"]["birthCountry"]["missing_count"] == 68
+
+
+def test_filtered_seed_statistics_match_independent_csv_population(
+    express_client, express_headers, seed_player_records, expected_statistics
+):
+    records = [
+        record
+        for record in seed_player_records
+        if record["birthCountry"] == "USA"
+        and record["birthYear"] is not None
+        and 1930 <= float(record["birthYear"]) <= 1940
+        and record["bats"] == "R"
+        and record["throws"] == "R"
+    ]
+    assert len(records) > 20
+    response = express_client.get(
+        STATISTICS_URL,
+        headers=express_headers,
+        query_string={
+            "birth_country": "USA",
+            "birth_year_min": "1930",
+            "birth_year_max": "1940",
+            "bats": "R",
+            "throws": "R",
+            "group_limit": "1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_statistics(records, group_limit=1),
+        "request_id": response.headers["X-Request-ID"],
+    }
 
 
 def test_legacy_player_routes_stay_unauthenticated_and_unchanged(

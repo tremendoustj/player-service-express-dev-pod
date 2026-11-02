@@ -4,7 +4,7 @@ Assessment date: 2026-11-02.
 
 **Status: shared data access, bounded search/filter, population statistics,
 numeric rankings, comparisons, opt-in SQLite deadlines, and authenticated HTTP
-search/details implemented; remaining Express API operations/schema pending.**
+search/details/statistics implemented; remaining Express API operations/schema pending.**
 Player/country lookups are
 parameterized, reads explicitly close their read-only SQLite connections, and
 missing-player handling has regression coverage. Internal search supports validated filters and
@@ -14,10 +14,12 @@ with deterministic ties and explicit null exclusions. Comparisons preserve
 requested player order, report pairwise numeric differences, and reject missing IDs.
 All shared reads can opt into a monotonic execution budget and bounded lock waits;
 legacy calls retain their existing timeout defaults.
-The opt-in search/filter and detail endpoints now have fail-closed configuration,
+The opt-in search/filter, detail, and statistics endpoints now have fail-closed configuration,
 bearer authentication, strict HTTP validation, correlation IDs, and sanitized structured
 request log messages. Detail reads validate exact IDs, bound duplicate detection,
 and return an explicit 404 for absent players.
+Statistics describe the entire filtered population with bounded groups and
+explicit missing/omitted counts, not a paginated subset.
 [Their configuration and contracts](express-api.md) distinguish
 implemented behavior from the remaining endpoints, OpenAPI, metrics, and packaging.
 No MCP server is implemented. No infrastructure was deployed
@@ -45,10 +47,10 @@ and countries as SQL parameters and explicitly closes each read-only connection.
 The initial assessment found interpolated lookups and unclosed connections; the
 safe shared data-access increment below addresses those prerequisites.
 Legacy routes remain unauthenticated and retain their original responses.
-The additive integration search/detail endpoints implement authentication, validation,
+The additive integration search/detail/statistics endpoints implement authentication, validation,
 request correlation, and structured log messages. Operational metrics and
 production HTTP request limits remain pending. Shared service reads support
-optional SQLite deadlines, enabled for integration search/details but not for legacy routes.
+optional SQLite deadlines, enabled for all implemented integration operations but not for legacy routes.
 The development entry point binds port 8000 on all interfaces with debug enabled.
 Live Ollama requests remain unverified; the missing-player error path now has
 local Flask test-client coverage.
@@ -247,8 +249,9 @@ Do not expose this service directly as an unauthenticated integration.
 
 ### Filtered population statistics (increment 4)
 
-`PlayerService.get_player_statistics(filters=None, *, group_limit=20)` is an
-internal Python method, **not an HTTP endpoint or published tool**. It reuses the
+`PlayerService.get_player_statistics(filters=None, *, group_limit=20)` was
+introduced as an internal Python method; increment 10 now exposes it through
+authenticated HTTP, not a published tool. It reuses the
 same validated `PlayerFilters` and parameterized filter builder as search. All
 statistics describe the **entire filtered population**, independently of search
 pagination or the categorical group limit.
@@ -571,7 +574,7 @@ success/failure responses remain compatible. These are local Flask/SQLite
 results, not real network, Express/Nexla, MCP, Docker, or live Ollama validation.
 
 This was deliberately the first HTTP operation, not the entire API gate. Detail
-is implemented in increment 9 below. Statistics, rankings, comparisons,
+and statistics are implemented in increments 9 and 10 below. Rankings, comparisons,
 the OpenAPI contract, operational metrics, production packaging/logging, and
 real network/external validation remain pending. No platform resources were
 created or published.
@@ -602,7 +605,7 @@ Logs use the detail route template instead of the requested ID, and count one
 successful result or zero on failure. The [HTTP guide](express-api.md#player-details)
 documents decoding, HEAD/OPTIONS, inputs, and response/error semantics.
 
-The local suite has **839 passing tests**, including 118 additional cases for
+At the end of increment 9, the local suite had **839 passing tests**, including 118 additional cases for
 detail contracts and shared boundaries. Coverage checks exact ID/length/case
 bounds, binary matching even with a NOCASE column, bounded duplicate detection,
 missing players, authentication before reads, encoded-path validation, rejected
@@ -612,6 +615,43 @@ converted CSV records, including missing measurements; search pagination and
 all legacy/analytics regression tests still pass. These are local Flask
 test-client and SQLite results, not network, Docker, live Ollama, or
 Express/Nexla validation. No resources were deployed or published.
+
+### Authenticated population statistics (increment 10)
+
+`GET /integrations/express/v1/statistics` now exposes the existing aggregate
+service through the opt-in authenticated boundary. It accepts all six search
+filters plus `group_limit` (1-100, default 20). Shared strict query decoding and
+filter construction keep search and statistics semantics aligned while enforcing
+separate parameter allowlists. Statistics reject pagination and search rejects
+`group_limit`; invalid inputs fail before schema inspection or query execution.
+Legacy routes and response contracts remain unchanged.
+
+Success contains `total`, `numeric`, `groups`, and `request_id`, with no top-level
+`data` or pagination. Numeric and categorical summaries cover the entire matching
+population from one read snapshot; missing and omitted counts remain explicit.
+The group cap does not reduce the population count or numeric aggregates.
+Statistics logs report the matched population as `result_count`, including zero
+for an empty successful result. Every failed request reports zero results.
+
+The route reuses configured deadlines, strict JSON serialization, safe errors,
+correlation headers, and redacted logging. Invalid numeric aggregates, overflow,
+unserializable returned categories, and group-query failures return sanitized
+503 errors, never a partial successful summary. Cancellations return 504.
+The [HTTP contract](express-api.md#population-statistics) documents accepted inputs,
+output shape, null/truncation semantics, HEAD/OPTIONS, and connector-binding
+considerations; search's `$.data` extraction is not suitable for this envelope.
+
+The complete local suite has **970 passing tests**, including 131 additional
+cases for statistics and shared boundaries. Coverage checks each filter, full
+population counts, default/minimum/maximum group limits over 101 categories,
+nulls, empty results, strict parsing before reads, disabled/authenticated routes,
+redacted logs, real SQLite lock/deadline failures, failure cleanup, and independent
+CSV-derived aggregates over all **19,370 players** and a filtered population.
+The independent statistics expectation helper is shared by service and HTTP
+tests; no service result is used as the expected HTTP aggregate. These are local
+Flask test-client/SQLite results, not network, Docker, live Ollama, or Express/Nexla
+validation. Rankings/comparisons HTTP, OpenAPI, metrics, packaging, and external
+validation remain pending. No resources were deployed or published.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -677,7 +717,7 @@ recommendation feedback, or Ollama chat as an integration tool.
 
 ## 4. Application/tool contract (partially implemented)
 
-Search/filter and detail HTTP are implemented; the other contracts in this section
+Search/filter, detail, and statistics HTTP are implemented; the other contracts in this section
 are **planned**, not existing routes.
 Internal search/filter, statistics, ranking, and comparison semantics are
 implemented as described in increments 3 through 6.
@@ -689,7 +729,7 @@ schemas must be inspected rather than assumed to match automatically.
 | --- | --- | --- |
 | `search_players` | `/players` (**implemented**) | Search IDs/names and filter by birth country, inclusive birth-year range, bats, and throws. Search and filtering share one query implementation. |
 | `get_player` | `/players/{player_id}` (**implemented**) | Retrieve a single full record by exact, case-sensitive ID; return 404 if absent, or 503 if selected stored IDs are duplicated. No query parameters or pagination. |
-| `get_player_statistics` | `/statistics` (pending) | Count the filtered population; bounded groups by birth country/bats/throws; count/min/max/mean for birth year, height, and weight. Include known/missing counts. |
+| `get_player_statistics` | `/statistics` (**implemented**) | Count the entire filtered population; bounded groups by birth country/bats/throws; count/min/max/mean for birth year, height, and weight. Include known/missing/omitted counts. Accept shared filters and `group_limit` (1-100, default 20), not pagination. |
 | `rank_players` | `/rankings` (pending) | Order by the allowlisted `height`, `weight`, or `birthYear`, with `asc`/`desc` direction (default `desc`) and ascending player-ID tie-breaks. Exclude null metrics and report `excluded_count`; pagination totals count rankable players. No performance-quality claim. |
 | `compare_players` | `/comparisons` (pending) | Compare 2-5 distinct player IDs in supplied order, with all pairwise left-minus-right differences for birth year, height, and weight. Differences are null if either value is unknown. Any missing ID is an explicit error, not a silently incomplete comparison. |
 
@@ -738,7 +778,7 @@ Only fixed, allowlisted columns/operations may participate in queries.
   query-only enforcement. A missing database must fail clearly, not create an
   empty database during a tool call.
 - The service now supports bounded busy waits and monotonic query deadlines
-  (increment 7). Integration search/details opt into the default 1-second
+  (increment 7). Integration search/details/statistics opt into the default 1-second
   busy wait and 2-second read budget; remaining routes must use the same boundary.
   Legacy defaults are unchanged. A connection
   timeout alone does **not** limit query execution. Bound request size and
@@ -816,7 +856,8 @@ or document and validate a deliberate compatibility decision.
 | Cancellable SQLite reads (**complete**) | Validated opt-in query budgets and busy waits; monotonic deadlines shared across read statements; progress cancellation and short-query checks; real CPU/lock contention, transaction cleanup, full-seed compatibility, and unchanged legacy defaults. |
 | Authenticated search/filter HTTP (**complete**) | Opt-in route and fail-closed settings, strict header/query/body handling before reads, configured deadlines, safe errors, request IDs/log messages, full-seed HTTP test-client pagination, and legacy/Ollama compatibility (Ollama mocked). |
 | Authenticated player-detail HTTP (**complete**) | Shared strict ID validation, exact binary identity, one bounded read with duplicate detection, safe missing-player 404, shared authentication/deadlines/serialization/logging, seed-backed records, and unchanged legacy lookup contracts. |
-| Remaining integration API and schema | Wire statistics/rankings/comparisons through the same authenticated boundary and publish/test the OpenAPI contract. Cover all operations, malformed inputs, unavailable/locked storage, and missing records without changing legacy routes. |
+| Authenticated population-statistics HTTP (**complete**) | Shared strict filter parsing and separate parameter allowlists, bounded groups over full-population aggregates, explicit null/omitted counts, safe serialization/failure mapping, configured deadlines, correlated/redacted logs, and independent fixture/seed expectations. |
+| Remaining integration API and schema | Wire rankings/comparisons through the same authenticated boundary and publish/test the OpenAPI contract. Cover all operations, malformed inputs, unavailable/locked storage, and missing records without changing legacy routes. |
 | Operational observability | Extend the implemented correlation IDs/redacted request log messages with production logging configuration, bounded metrics labels, counters, and latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
 | Express/Nexla validation | Operator-approved, authenticated Studio/connector setup; review generated contracts and call every capability, inspect receipts, and compare with local expected results. If a custom MCP adapter is necessary, add and verify it before claiming this gate. Otherwise document exact outstanding external blockers. |
@@ -876,7 +917,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.

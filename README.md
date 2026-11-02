@@ -24,8 +24,12 @@ at `GET /integrations/express/v1/players` and exact-ID details at
 reads, correlation IDs, sanitized errors, and structured request log messages.
 Details return one full record, a 404 for an absent ID, or a storage error for
 duplicate stored IDs; legacy detail behavior is unchanged.
+`GET /integrations/express/v1/statistics` exposes full-population summaries
+through the same boundary, with shared filters and a bounded `group_limit`.
+It reports null measurements and omitted groups explicitly, without pagination
+or performance-statistics claims.
 It is disabled by default; see the linked configuration and local-only setup.
-The remaining integration endpoints, OpenAPI contract, metrics, packaging, and
+Rankings/comparisons HTTP endpoints, the OpenAPI contract, metrics, packaging, and
 Express/Nexla validation are still pending. Legacy API response formats are
 unchanged.
 

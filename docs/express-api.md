@@ -1,8 +1,9 @@
-# Express integration API: authenticated search and details
+# Express integration API: authenticated search, details, and statistics
 
-**Status: opt-in search/filter and player-detail endpoints are implemented and
-locally tested.** Statistics, rankings, comparisons, and the OpenAPI contract are
-not yet exposed through this API. Their shared service methods already exist.
+**Status: opt-in search/filter, player-detail, and population-statistics endpoints
+are implemented and locally tested.** Rankings, comparisons, and the OpenAPI
+contract are not yet exposed through this API. The remaining service methods
+already exist.
 Metrics, production packaging, real loopback HTTP smoke tests, and authenticated
 Express/Nexla validation remain pending.
 
@@ -81,7 +82,7 @@ debugger, or model service to make the connector work.
 
 ## Authentication
 
-Search and player-detail requests require
+All implemented integration operations require
 `Authorization: Bearer <application token>`. The scheme is case-insensitive;
 the token is case-sensitive. Use exactly one space between scheme and token.
 Malformed, duplicate, missing, or incorrect credentials receive the same 401
@@ -195,6 +196,68 @@ legacy ID inputs, returns a bare record on success, and retains its HTTP-200
 missing-player error. The stricter bounds and 404 contract apply only to the
 integration detail operation.
 
+## Population statistics
+
+`GET /integrations/express/v1/statistics` describes the **entire filtered
+population**, not a search page. For example,
+`/integrations/express/v1/statistics?birth_country=USA&group_limit=1`
+summarizes all matching players while returning at most one category per grouped
+field. It uses the same bearer authentication, query-size/body restrictions,
+SQLite deadlines, correlation headers, and no-store policy as search.
+
+| Query parameter | Semantics |
+| --- | --- |
+| `q`, `birth_country`, `birth_year_min`, `birth_year_max`, `bats`, `throws` | The same optional, AND-combined [search filters](#search-and-filtering), with identical validation, literal text matching, and null behavior. |
+| `group_limit` | 1-100, default 20. Caps the returned categories independently for each grouped field, never the number of players summarized. |
+
+Only these seven scalar parameters are accepted, each at most once.
+`group_limit` uses the same canonical unsigned ASCII decimal notation as search
+integers. Unknown/duplicate parameters, malformed UTF-8/percent escapes, empty
+values, and invalid filters return 400 before any database access. **`limit` and
+`offset` are not supported**, nor are caller-supplied grouping fields or SQL.
+There is no group pagination. HEAD performs the same validated, bounded read
+without a body; authenticated OPTIONS performs no database read.
+
+A successful response contains exactly `total`, `numeric`, `groups`, and
+`request_id`; there is no top-level `data` or `pagination`:
+
+| Response field | Contents |
+| --- | --- |
+| `total` | Integer count of every matching player, including players with missing attributes. |
+| `numeric` | Objects keyed by `birthYear`, `height`, and `weight`, each containing `known_count`, `missing_count`, `min`, `max`, and `mean`. |
+| `groups` | Objects keyed by `birthCountry`, `bats`, and `throws`, each containing `data`, `known_count`, `missing_count`, `total_groups`, `limit`, and `other_count`. |
+| `request_id` | The same correlation identifier as the `X-Request-ID` response header. |
+
+Numeric summaries exclude SQL NULL from the extrema and mean; zero is a known
+value, not missing. If no values are known, `min`, `max`, and `mean` are null.
+An empty population is HTTP 200 with `total=0`, zero counts, null numeric measures,
+and empty category arrays, not a missing-player error.
+
+Each group's `data` is an array of `{"value": <stored value>, "count": <integer>}`
+objects ordered by count descending, then exact value ascending using binary
+collation. SQL NULL is counted only in `missing_count`; empty strings and literal
+`Unknown` remain distinct known values. `total_groups` counts all distinct
+non-null categories; `other_count` counts **players in omitted categories**, not
+the number of omitted categories. For each field,
+`known_count + missing_count = total`; for each group,
+`sum(data[*].count) + other_count = known_count`.
+
+A positive `other_count` means the distribution is truncated. Raise `group_limit`
+or narrow the filters rather than treating the returned groups as complete.
+The maximum of 100 covers all 55 known birth countries in the supplied seed,
+but does not promise complete distributions for an arbitrary future database.
+Values retain their source meaning; the API does not assert measurement units,
+current-season data, baseball performance statistics, or player quality.
+
+`PlayerService.get_player_statistics()` computes the summary and three group
+queries in one read-only transaction and shared operation deadline. They observe
+one SQLite snapshot even during a concurrent WAL write. Schema inspection has
+its own deadline, as with search; neither budget is a hard total HTTP timeout.
+Invalid numeric storage, overflowing aggregates, or unserializable returned
+group values produce 503 `storage_unavailable`. A failed group query never
+returns a partial summary. Deadline cancellation produces 504 `query_timeout`;
+connections close on success and failure.
+
 ## Errors and correlation
 
 All integration JSON errors use this envelope:
@@ -213,11 +276,11 @@ All integration JSON errors use this envelope:
 | --- | --- | --- |
 | 400 | `invalid_request` | Invalid, ambiguous, or unsupported input, including a GET/HEAD body. |
 | 401 | `unauthorized` | Missing, malformed, or incorrect application credential. |
-| 404 | `not_found` | No implemented route at this URL; analytics URLs remain unavailable. |
+| 404 | `not_found` | No implemented route at this URL; `/rankings` and `/comparisons` remain unavailable. |
 | 404 | `player_not_found` | The well-formed requested player ID does not exist. |
 | 405 | `method_not_allowed` | Unsupported method; the response preserves the `Allow` header. |
 | 414 | `request_too_large` | Encoded query string exceeds 4096 bytes. |
-| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values or duplicate selected detail IDs. |
+| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values, invalid/overflowing numeric aggregates, or duplicate selected detail IDs. |
 | 504 | `query_timeout` | Database read deadline exceeded. |
 | 500 | `internal_error` | Unexpected failure, with sanitized diagnostics in the request log. |
 
@@ -236,7 +299,10 @@ Request logs use a JSON message with UTC timestamp, fixed operation/route
 template, status, duration, request ID, result count, error code, and exception
 class where applicable. Unknown routes use the literal `unmatched`, not the raw
 path. Detail requests log a fixed route template, not the player ID, and report
-one result on success or zero on failure. Tokens, request/query/body contents,
+one result on success or zero on failure. Statistics log the **full matched
+population** as `result_count`, not the number of returned categories; failures
+report zero, including failures after some aggregates have been computed.
+Tokens, request/query/body contents,
 player records, SQL, and exception messages/tracebacks are excluded. Successes
 use INFO and failures use WARNING
 on Flask's application logger; configure logging to retain INFO when deploying.
@@ -256,6 +322,10 @@ Nexla service key, disable certificate verification, or pass this token as a
 tool argument. A shared application token does not establish an individual
 Express user's identity in Flask.
 
+Statistics return an aggregate envelope, not rows at `$.data`. Do not reuse the
+search response-extraction path for this operation: preserve `total`, `numeric`,
+`groups`, and correlation metadata when reviewing its generated tool binding.
+
 This is a supported header-credential mechanism, not evidence that MCP Studio
 has discovered or bound the endpoint. There is no documented arbitrary Express
 chat API or assumed OpenAPI import in this implementation. Do not publish a
@@ -270,7 +340,7 @@ source player-service-app/.venv/bin/activate
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
 
-The complete local suite passes **839 tests**. Coverage includes disabled/invalid
+The complete local suite passes **970 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
@@ -279,5 +349,9 @@ pagination over **19,370 unique seed IDs**. Detail coverage includes exact
 ID/length/case boundaries, malformed encoded paths, rejected query inputs,
 missing/duplicate records, bounded retrieval, and independent CSV expectations
 for seed records with nullable fields. Legacy player responses and mocked
-Ollama success/failure behavior are retained. Flask test-client coverage is not
+Ollama success/failure behavior are retained. Statistics coverage verifies all
+shared filters, exact group-limit bounds over 101 categories, empty/all-null
+populations, rejected pagination, nonfinite/overflowing aggregates, safe group
+failures, redacted logs, and independent full-seed and filtered-seed expectations.
+Flask test-client coverage is not
 a real network, container, live Ollama, or Express/Nexla end-to-end result.

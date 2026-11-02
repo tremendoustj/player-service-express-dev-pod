@@ -15,7 +15,9 @@ from flask import Blueprint, Flask, Response, g, jsonify, request
 from werkzeug.exceptions import HTTPException
 
 from player_service import (
+    DEFAULT_GROUP_LIMIT,
     DEFAULT_PAGE_LIMIT,
+    MAX_GROUP_LIMIT,
     MAX_PAGE_LIMIT,
     MAX_PAGE_OFFSET,
     MIN_QUERY_TIMEOUT_SECONDS,
@@ -36,7 +38,7 @@ _AUTH_PATTERN = re.compile(r"(?i:Bearer) ([A-Za-z0-9_-]{43,256})")
 _REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _INTEGER_PATTERN = re.compile(r"(?:0|[1-9][0-9]{0,5})")
 _INVALID_PERCENT_ESCAPE = re.compile(rb"%(?![0-9A-Fa-f]{2})")
-_SEARCH_PARAMETERS = frozenset(
+_FILTER_PARAMETERS = frozenset(
     (
         "q",
         "birth_country",
@@ -44,10 +46,10 @@ _SEARCH_PARAMETERS = frozenset(
         "birth_year_max",
         "bats",
         "throws",
-        "limit",
-        "offset",
     )
 )
+_SEARCH_PARAMETERS = _FILTER_PARAMETERS | {"limit", "offset"}
+_STATISTICS_PARAMETERS = _FILTER_PARAMETERS | {"group_limit"}
 
 
 @dataclass(frozen=True)
@@ -123,7 +125,7 @@ def _integer(name: str, value: str, minimum: int, maximum: int) -> int:
     return number
 
 
-def _search_arguments() -> tuple[PlayerFilters, int, int]:
+def _query_arguments(allowed_parameters: frozenset[str]) -> dict[str, str]:
     raw_query = request.query_string
     if _INVALID_PERCENT_ESCAPE.search(raw_query):
         raise ValueError("Query parameters must use valid UTF-8 percent encoding")
@@ -134,20 +136,24 @@ def _search_arguments() -> tuple[PlayerFilters, int, int]:
             strict_parsing=True,
             encoding="utf-8",
             errors="strict",
-            max_num_fields=len(_SEARCH_PARAMETERS),
+            max_num_fields=len(allowed_parameters),
         )
     except ValueError:
         raise ValueError("Query parameters are malformed or too numerous") from None
     arguments = {}
     for name, value in pairs:
-        if name not in _SEARCH_PARAMETERS:
+        if name not in allowed_parameters:
             raise ValueError("Unknown query parameter")
         if name in arguments:
             raise ValueError("Query parameters must not be repeated")
         arguments[name] = value
+    return arguments
+
+
+def _player_filters(arguments: Mapping[str, str]) -> PlayerFilters:
     minimum = arguments.get("birth_year_min")
     maximum = arguments.get("birth_year_max")
-    filters = PlayerFilters(
+    return PlayerFilters(
         q=arguments.get("q"),
         birth_country=arguments.get("birth_country"),
         birth_year_min=(
@@ -159,6 +165,11 @@ def _search_arguments() -> tuple[PlayerFilters, int, int]:
         bats=arguments.get("bats"),
         throws=arguments.get("throws"),
     )
+
+
+def _search_arguments() -> tuple[PlayerFilters, int, int]:
+    arguments = _query_arguments(_SEARCH_PARAMETERS)
+    filters = _player_filters(arguments)
     limit = _integer(
         "limit", arguments.get("limit", str(DEFAULT_PAGE_LIMIT)), 1, MAX_PAGE_LIMIT
     )
@@ -231,6 +242,22 @@ def configure_express_api(app: Flask) -> None:
             return _error(400, "invalid_request", str(exc))
         result = player_service().get_player(player_id)
         return success_response({"data": result}, result_count=1)
+
+    @api.get("/statistics")
+    def get_player_statistics():
+        try:
+            arguments = _query_arguments(_STATISTICS_PARAMETERS)
+            filters = _player_filters(arguments)
+            group_limit = _integer(
+                "group_limit",
+                arguments.get("group_limit", str(DEFAULT_GROUP_LIMIT)),
+                1,
+                MAX_GROUP_LIMIT,
+            )
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
+        result = player_service().get_player_statistics(filters, group_limit=group_limit)
+        return success_response(result, result_count=result["total"])
 
     @api.errorhandler(PlayersNotFoundError)
     def players_not_found(exc):

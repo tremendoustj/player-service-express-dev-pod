@@ -1,8 +1,6 @@
 import json
 import sqlite3
-from collections import Counter
 from contextlib import closing
-from statistics import mean
 
 import pytest
 
@@ -14,38 +12,8 @@ def service(player_db):
     return PlayerService(player_db)
 
 
-def expected_statistics(records, group_limit=20):
-    total = len(records)
-    numeric = {}
-    for field in ("birthYear", "height", "weight"):
-        values = [float(record[field]) for record in records if record[field] is not None]
-        numeric[field] = {
-            "known_count": len(values),
-            "missing_count": total - len(values),
-            "min": min(values, default=None),
-            "max": max(values, default=None),
-            "mean": pytest.approx(mean(values)) if values else None,
-        }
-    groups = {}
-    for field in ("birthCountry", "bats", "throws"):
-        counts = Counter(
-            record[field] for record in records if record[field] is not None
-        )
-        values = sorted(counts, key=lambda value: (-counts[value], value))[:group_limit]
-        known_count = sum(counts.values())
-        groups[field] = {
-            "data": [{"value": value, "count": counts[value]} for value in values],
-            "known_count": known_count,
-            "missing_count": total - known_count,
-            "total_groups": len(counts),
-            "limit": group_limit,
-            "other_count": known_count - sum(counts[value] for value in values),
-        }
-    return {"total": total, "numeric": numeric, "groups": groups}
-
-
 def test_statistics_preserve_nulls_and_use_only_known_measurements(
-    service, player_records
+    service, player_records, expected_statistics
 ):
     result = service.get_player_statistics()
 
@@ -100,7 +68,7 @@ def test_statistics_preserve_nulls_and_use_only_known_measurements(
     ],
 )
 def test_statistics_apply_shared_filters_to_every_aggregate(
-    service, player_records, filters, record_indexes
+    service, player_records, expected_statistics, filters, record_indexes
 ):
     result = service.get_player_statistics(PlayerFilters(**filters), group_limit=1)
 
@@ -111,7 +79,9 @@ def test_statistics_apply_shared_filters_to_every_aggregate(
 
 
 @pytest.mark.parametrize("q", ["%", "_", "\\"])
-def test_statistics_search_is_literal(service, player_db, player_records, q):
+def test_statistics_search_is_literal(
+    service, player_db, player_records, expected_statistics, q
+):
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute(
             "UPDATE players SET nameGiven = ? WHERE playerId = ?",
@@ -124,7 +94,9 @@ def test_statistics_search_is_literal(service, player_db, player_records, q):
     )
 
 
-def test_empty_population_has_explicit_zero_counts_and_null_measures(service, player_db):
+def test_empty_population_has_explicit_zero_counts_and_null_measures(
+    service, player_db, expected_statistics
+):
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute("DELETE FROM players")
         conn.commit()
@@ -153,7 +125,7 @@ def test_zero_measurements_are_known_not_missing(service, player_db):
 
 
 def test_group_limit_does_not_limit_the_population_or_hide_omitted_counts(
-    service, player_records
+    service, player_records, expected_statistics
 ):
     result = service.get_player_statistics(group_limit=1)
 
@@ -274,7 +246,7 @@ def test_overflowing_mean_raises_instead_of_returning_infinity(service, player_d
 
 @pytest.mark.parametrize("field", ["birthCountry", "bats", "throws"])
 def test_all_statistics_queries_share_one_snapshot(
-    service, player_db, player_records, monkeypatch, field
+    service, player_db, player_records, expected_statistics, monkeypatch, field
 ):
     with closing(sqlite3.connect(player_db)) as conn:
         assert conn.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
@@ -304,7 +276,9 @@ def test_all_statistics_queries_share_one_snapshot(
 
 
 @pytest.mark.parametrize("group_limit", [20, 100])
-def test_complete_repository_seed_statistics(service, seed_player_records, group_limit):
+def test_complete_repository_seed_statistics(
+    service, seed_player_records, expected_statistics, group_limit
+):
     result = service.get_player_statistics(group_limit=group_limit)
 
     assert result == expected_statistics(seed_player_records, group_limit)
@@ -318,7 +292,7 @@ def test_complete_repository_seed_statistics(service, seed_player_records, group
 
 
 def test_filtered_seed_statistics_match_independent_population(
-    service, seed_player_records
+    service, seed_player_records, expected_statistics
 ):
     records = [
         record

@@ -142,7 +142,7 @@ def test_bad_configuration_fails_before_database_initialization(
         app.create_app()
 
 
-@pytest.mark.parametrize("path", ["/players", "/players/aaronha01"])
+@pytest.mark.parametrize("path", ["/players", "/players/aaronha01", "/statistics"])
 def test_default_app_has_no_integration_routes_or_headers(client, path):
     response = client.get(API_PREFIX + path)
     assert response.status_code == 404

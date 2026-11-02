@@ -1,7 +1,9 @@
 import csv
 import secrets
 import sqlite3
+from collections import Counter
 from contextlib import closing
+from statistics import mean
 
 import pytest
 
@@ -34,6 +36,42 @@ PLAYER_COLUMNS = (
     "retroID",
     "bbrefID",
 )
+
+
+@pytest.fixture
+def expected_statistics():
+    def calculate(records, group_limit=20):
+        total = len(records)
+        numeric = {}
+        for field in ("birthYear", "height", "weight"):
+            values = [
+                float(record[field]) for record in records if record[field] is not None
+            ]
+            numeric[field] = {
+                "known_count": len(values),
+                "missing_count": total - len(values),
+                "min": min(values, default=None),
+                "max": max(values, default=None),
+                "mean": pytest.approx(mean(values)) if values else None,
+            }
+        groups = {}
+        for field in ("birthCountry", "bats", "throws"):
+            counts = Counter(
+                record[field] for record in records if record[field] is not None
+            )
+            values = sorted(counts, key=lambda value: (-counts[value], value))[:group_limit]
+            known_count = sum(counts.values())
+            groups[field] = {
+                "data": [{"value": value, "count": counts[value]} for value in values],
+                "known_count": known_count,
+                "missing_count": total - known_count,
+                "total_groups": len(counts),
+                "limit": group_limit,
+                "other_count": known_count - sum(counts[value] for value in values),
+            }
+        return {"total": total, "numeric": numeric, "groups": groups}
+
+    return calculate
 
 
 @pytest.fixture
