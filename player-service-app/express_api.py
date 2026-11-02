@@ -370,7 +370,11 @@ def configure_express_api(app: Flask) -> None:
             error_code=event["error_code"],
         )
         level = logging.WARNING if response.status_code >= 400 else logging.INFO
-        app.logger.log(level, json.dumps(event, separators=(",", ":")))
+        app.logger.log(
+            level,
+            json.dumps(event, separators=(",", ":")),
+            extra={"express_event": event},
+        )
         return response
 
     app.register_blueprint(api)

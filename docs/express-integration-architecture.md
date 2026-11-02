@@ -5,7 +5,8 @@ Assessment date: 2026-11-02.
 **Status: shared data access, bounded search/filter, population statistics,
 numeric rankings, comparisons, opt-in SQLite deadlines, and authenticated HTTP
 search/details/statistics/rankings/comparisons implemented, with a validated
-OpenAPI 3.1 contract and authenticated operational metrics.**
+OpenAPI 3.1 contract, authenticated operational metrics, and a tested production
+WSGI/logging profile.**
 Player/country lookups are
 parameterized, reads explicitly close their read-only SQLite connections, and
 missing-player handling has regression coverage. Internal search supports validated filters and
@@ -26,10 +27,12 @@ Rankings use required allowlisted metrics, bounded pages, and explicit exclusion
 Comparisons accept 2-5 ordered IDs and return full records and null-aware
 pairwise differences, with an explicit 404 if any selected player is missing.
 [Their configuration and contracts](express-api.md) distinguish
-implemented behavior from the remaining production packaging/log-handler and
+implemented behavior from the remaining container packaging and tenant
 validation work. A private, authenticated metrics route now provides bounded
 request/error counters and latency histograms with per-app, single-process
 collection and thread-safe updates.
+The [Gunicorn profile](express-production.md) now enforces one threaded worker,
+retains redacted JSON logs, and has real loopback HTTP coverage.
 The [versioned OpenAPI document](express-openapi.json) is a local contract, not a
 published route or a verified Express import format.
 No MCP server is implemented. No infrastructure was deployed
@@ -59,8 +62,10 @@ safe shared data-access increment below addresses those prerequisites.
 Legacy routes remain unauthenticated and retain their original responses.
 The additive integration endpoints implement
 authentication, validation, request correlation, and structured log messages.
-Operational metrics are implemented in increment 14; production HTTP request
-limits and log-handler configuration remain pending. Shared service reads support
+Operational metrics are implemented in increment 14; increment 15 adds a
+production WSGI profile with request-line/header limits and redacted log
+handlers. Approved ingress/body/time/rate controls remain external deployment
+requirements. Shared service reads support
 optional SQLite deadlines, enabled for all implemented integration operations but not for legacy routes.
 The development entry point binds port 8000 on all interfaces with debug enabled.
 Live Ollama requests remain unverified; the missing-player error path now has
@@ -837,6 +842,47 @@ configuration. No processes, monitoring services, or platform resources were
 deployed. Production logging/container configuration, real loopback HTTP smoke
 tests, and approval-gated tenant validation remain pending.
 
+### Production WSGI serving and logging (increment 15)
+
+The [production profile](express-production.md) uses the existing Flask app via
+`wsgi:app` and a checked-in Gunicorn configuration. The published runtime pin
+`gunicorn==26.2.0` requires Unix and Python 3.10+; a conditional dependency keeps
+the legacy application's Python 3.9+ requirement unchanged. Local validation
+used Python 3.11.17 on macOS.
+
+The default listener is loopback-only, with one `gthread` worker and four
+threads. Unsupported worker counts/classes and code reloading fail startup;
+worker-count changes also fail. The runtime-control socket is disabled.
+Request-line and header limits are enforced before Flask, without treating
+Gunicorn's threaded-worker heartbeat timeout as a per-request deadline.
+Server parser rejections lack the application's JSON envelope, request ID, and
+metrics because they never reach Flask; admitted requests retain all existing
+contracts and authentication.
+
+Integration INFO/WARNING records are emitted once as JSON, with additional
+severity/logger/process metadata. Non-propagating access-log suppression is
+explicit: Gunicorn's logging dictionary activates its access path even when
+`accesslog=None`. Server/parser log messages and exception text can contain
+request data, so only safe metadata and exception classes are formatted.
+Gunicorn additionally prints boot exceptions outside logging handlers; the
+WSGI entry point logs expected startup failures and raises a fixed fatal
+message instead of exposing configuration, filesystem, CSV, or SQL diagnostics.
+Proxy logging remains an operator-owned, unvalidated deployment gate.
+
+The complete suite passes **1553 tests**, including **29 production/logging
+tests**. Real ephemeral loopback HTTP covers all five operations, filtered
+pagination, concurrent IDs and single-worker metrics, auth/validation/storage
+errors, legacy reads, malformed requests, and exact request-line/header limits.
+Temporary application copies cover fresh CSV initialization, existing read-only
+files, disabled/invalid configuration, and sanitized file/CSV/SQL startup
+failures. Each test stops and checks its server/worker process group.
+
+The default application-relative database and import-time initialization remain
+unchanged. This is not Docker read-only-mount, live Ollama, MCP, Nexla connector,
+or Express chat validation. Container packaging, controlled database
+provisioning, secret-file injection, and approval-gated tenant validation remain
+pending. No infrastructure or platform resources were deployed or published.
+
 ## 2. Verified Express.dev / Nexla mechanisms
 
 The following are supported by official documentation retrieved on the assessment
@@ -994,9 +1040,10 @@ histogram are implemented with bounded labels, as described in
 [increment 14](#authenticated-operational-metrics-increment-14). Keep the
 authenticated metrics surface private and exclude it from generated tools and
 public ingress. Do not label metrics with player IDs, request IDs, or search text.
-Production packaging must verify one threaded WSGI worker per scrape target;
-multi-process aggregation is not implemented. Production log-handler and access
-log redaction configuration remain pending.
+The supplied [WSGI profile](express-production.md) verifies one threaded worker
+per scrape target and redacted application/server logging over real HTTP;
+multi-process aggregation is not implemented. Container packaging and
+operator-approved ingress/proxy log configuration remain pending.
 
 Capture Nexla receipt IDs during external validation alongside application
 request IDs. Whether Nexla forwards correlation headers/trace IDs is a tenant
@@ -1005,8 +1052,8 @@ validation item, not an assumed identity between these fields.
 ## 5. Packaging and configuration plan
 
 Add a Player Service container, without repurposing the model image: compatible
-Python runtime, production WSGI entry point, debug off, non-root execution, and
-health checks. Initialize/validate the database in an explicit controlled step
+Python runtime, the implemented production WSGI entry point, debug off, non-root
+execution, and health checks. Initialize/validate the database in an explicit controlled step
 before serving read-only integration traffic; test a fresh installation and an
 existing database. Preserve the development `app` export and default file path.
 Any optional Compose services should bind local ports to loopback and keep Ollama
@@ -1031,6 +1078,9 @@ unnecessary configuration. A Nexla service key is an operator/platform
 credential, not a required Flask runtime secret. Do not silently raise the
 advertised Python 3.9+ requirement; isolate any optional MCP runtime requirements
 or document and validate a deliberate compatibility decision.
+The optional Gunicorn profile requires Unix/Python 3.10+, uses a conditional
+dependency, and is verified on Python 3.11; it does not replace the legacy
+development runtime.
 
 ## 6. Incremental implementation and acceptance gates
 
@@ -1050,8 +1100,8 @@ or document and validate a deliberate compatibility decision.
 | Authenticated player-comparison HTTP (**complete**) | Shared cardinality/ID/uniqueness validation before database access, one ordered comma-separated ID parameter, bounded read and pairwise output, safe missing/duplicate/overflow errors, configured deadlines, redacted logs, and independent fixture/seed expectations. |
 | Integration API schema (**complete**) | Versioned OpenAPI 3.1 contract for all five operations; standards validation, route/parameter drift checks, list serialization, nullable output, malformed inputs, unavailable/locked storage, missing records, and full-seed schema coverage, without changing legacy routes. |
 | Operational metrics (**complete**) | Authenticated private scrape route, isolated per-app registries, bounded labels, request/error/auth-failure/timeout counters, latency histogram boundaries, real lock/deadline recovery, concurrent updates, and disabled/unsupported-mode checks. Keep metrics out of the player-tool OpenAPI contract. |
-| Production logging | Configure handlers to retain structured INFO request logs; disable/redact web-server and proxy access logs so raw URIs and credentials are not emitted. Verify in the production WSGI entry point. |
-| Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, read-only mounts, and one threaded worker per metrics scrape target. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
+| Production WSGI/logging (**locally complete**) | One threaded Gunicorn worker, structured INFO request logs, suppressed access output, sanitized parser/startup diagnostics, and real loopback HTTP verification. Approved proxy access-log policy remains an external deployment gate. |
+| Packaging and local integration (**partially complete**) | WSGI runbook, real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, read-only files, and one threaded worker are verified. Production container, controlled DB provisioning, secret-file settings, and actual read-only-mount validation remain pending. Run the entire suite and stop all locally started processes. |
 | Express/Nexla validation | Operator-approved, authenticated Studio/connector setup; review generated contracts and call every capability, inspect receipts, and compare with local expected results. If a custom MCP adapter is necessary, add and verify it before claiming this gate. Otherwise document exact outstanding external blockers. |
 
 Every implementation increment must update the relevant documentation and run
@@ -1109,10 +1159,11 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4/5/6/7/8/9/10/11/12/13/14 test
-results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
-or live Ollama integration success. Implementation work remains in addition to
-the external items; documenting blockers does not make the implementation complete.
+**End-to-end integration is not complete.** The test results above establish
+local Flask/SQLite coverage and, in increment 15, real Gunicorn loopback HTTP.
+They are not an Express, Nexla, MCP, Docker, or live Ollama integration success.
+Implementation work remains in addition to the external items; documenting
+blockers does not make the implementation complete.
 
 ## Official references
 

@@ -42,8 +42,12 @@ endpoint. [Authenticated operational metrics](docs/express-api.md#operational-me
 now expose request/error counters and latency histograms at
 `GET /integrations/express/v1/metrics`. Keep this scrape route private and out of
 Express tools; collection supports one worker process with multiple threads,
-not automatic multi-process aggregation. Production packaging/log-handler
-configuration, real HTTP smoke tests, and Express/Nexla validation remain pending.
+not automatic multi-process aggregation. A
+[single-worker Gunicorn profile](docs/express-production.md) now provides
+production WSGI serving, redacted JSON logging, and real loopback HTTP coverage
+for all five operations. Container
+packaging, controlled storage provisioning, and Express/Nexla validation remain
+pending.
 Legacy API response formats are unchanged.
 
 ## Dependencies
@@ -52,6 +56,9 @@ Legacy API response formats are unchanged.
 - sqllite3
 - Docker
 - [Ollama Python SDK](https://github.com/ollama/ollama-python)
+
+The optional production WSGI profile requires Unix and Python 3.10+; it does not
+raise the legacy application's Python 3.9+ requirement.
 
 ## 🛠️ Setup Instructions
 
@@ -111,6 +118,10 @@ For an activated `uv` environment without pip, use
 2. Verify the Player service is running
       1. Open your browser and visit `http://localhost:8000/v1/players`
       2. If the application is running successfully, you will see player data appear in the browser
+
+For a non-debug WSGI process with production logging, use the
+[Gunicorn profile](docs/express-production.md) instead of `python app.py`.
+It binds loopback by default and does not constitute a public deployment.
 
 ### Part 3: Start LLM Docker Container
 

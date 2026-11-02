@@ -3,8 +3,10 @@
 **Status: all five opt-in read operations (search/filter, player details,
 population statistics, numeric rankings, and comparisons) are implemented and
 locally tested, with a validated OpenAPI 3.1 contract and authenticated operational
-metrics.** Production packaging/log-handler configuration, real loopback HTTP
-smoke tests, and authenticated Express/Nexla validation remain pending.
+metrics.** A [production Gunicorn profile](express-production.md) now provides
+single-worker serving and redacted JSON logging, verified with real loopback HTTP
+smoke tests. Container packaging, controlled storage provisioning, and
+authenticated Express/Nexla validation remain pending.
 
 The [architecture assessment](express-integration-architecture.md) records the
 verified platform mechanisms, integration decision, remaining acceptance gates,
@@ -118,9 +120,10 @@ printf 'Authorization: Bearer %s\n' "$PLAYER_INTEGRATION_TOKEN" |
 Do not use verbose HTTP logging with real credentials. A loopback URL is not
 reachable from hosted Nexla. Production use requires an approved HTTPS ingress,
 authentication/rate controls, request/header/body limits, a production WSGI
-server, and private storage. Those deployment gates are not implemented or
-validated by this increment. Never expose the legacy routes, SQLite, Ollama,
-debugger, or model service to make the connector work.
+server, and private storage. The [Gunicorn profile](express-production.md)
+implements the WSGI process, logging, and request-line/header limits, not those
+external ingress controls or a container. Never expose the legacy routes,
+SQLite, Ollama, debugger, or model service to make the connector work.
 
 ## Authentication
 
@@ -476,13 +479,16 @@ and report zero on failure, including missing IDs and serialization failures.
 Tokens, request/query/body contents,
 player records, SQL, and exception messages/tracebacks are excluded. Successes
 use INFO and failures use WARNING
-on Flask's application logger; configure logging to retain INFO when deploying.
-Production log-handler formatting remains pending; operational metrics are
-implemented below.
-Web server/proxy access logs are separate and may include raw URIs; disable or
-redact those logs before production exposure. The application log tests do not
-validate those server logs. No application rate limiter or per-user authorization
-model is claimed.
+on Flask's application logger. The [production WSGI profile](express-production.md)
+retains INFO, writes one JSON event per request with severity/logger/process
+metadata, discards Gunicorn access output, and sanitizes server diagnostics.
+Those handlers and actual wire-level redaction are tested; a different server
+configuration must provide its own safe logging. Proxy access logs remain
+separate and must be disabled or redacted before production exposure.
+Server-level parser rejections happen before Flask and therefore do not have
+application correlation headers or metrics; see the production guide's exact
+limits and response boundary. No application rate limiter or per-user
+authorization model is claimed.
 
 ## Operational metrics
 
@@ -551,9 +557,10 @@ The [Prometheus client's multi-process mode](https://prometheus.github.io/client
 requires a different registry, directory lifecycle, and worker hooks and is
 deliberately not implemented. Both multi-process environment-variable spellings
 are rejected when the integration is enabled, but the app cannot enforce an
-external server's worker count. Production packaging must set and verify this
-worker model; no multi-worker, container, or deployed monitoring validation is
-claimed.
+arbitrary external server's worker count. The supplied
+[Gunicorn profile](express-production.md) sets and verifies one threaded worker,
+rejects worker-count changes, and has real concurrent HTTP/scrape coverage.
+No multi-worker, container, or deployed monitoring validation is claimed.
 
 ## Nexla binding and validation boundary
 
@@ -596,7 +603,7 @@ For an activated `uv` environment without pip, use
 To run only the contract checks, select
 `player-service-app/tests/test_express_openapi.py` instead of the tests directory.
 
-The complete local suite passes **1524 tests**. Coverage includes disabled/invalid
+The complete local suite passes **1553 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
@@ -634,5 +641,8 @@ success/error observations, authentication and validation, real SQLite locks and
 deadlines with recovery, redaction/cardinality, app isolation, thread-safe counts,
 concurrent Flask request IDs, private scrape behavior without database access,
 sanitized scrape failures, and unsupported multi-process configuration.
-Flask test-client coverage is not
-a real network, container, live Ollama, or Express/Nexla end-to-end result.
+The 29 production/logging tests add real loopback Gunicorn HTTP coverage for all
+five operations, exact wire limits, concurrent metrics, startup policies and
+failures, read-only files, and redaction of application/server output.
+Flask test-client and loopback HTTP coverage are not a container, live Ollama,
+or Express/Nexla end-to-end result.
