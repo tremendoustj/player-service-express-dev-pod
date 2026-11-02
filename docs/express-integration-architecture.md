@@ -2,13 +2,15 @@
 
 Assessment date: 2026-11-02.
 
-**Status: shared data access, bounded search/filter, and population statistics
-implemented; Express API pending.** Player/country lookups are parameterized,
-reads explicitly close their read-only SQLite connections, and missing-player
-handling has regression coverage. Internal search supports validated filters and
+**Status: shared data access, bounded search/filter, population statistics, and
+numeric rankings implemented; Express API pending.** Player/country lookups are
+parameterized, reads explicitly close their read-only SQLite connections, and
+missing-player handling has regression coverage. Internal search supports validated filters and
 deterministic pagination; statistics reuse those filters and explicitly report
-missing values and omitted groups. No integration endpoints, authentication,
-observability, or MCP server are implemented yet. No infrastructure was deployed
+missing values and omitted groups. Rankings reuse the filters and pagination,
+with deterministic ties and explicit null exclusions. Comparisons remain pending.
+No integration endpoints, authentication, observability, or MCP server are
+implemented yet. No infrastructure was deployed
 and no Nexla resources were created. This document distinguishes the existing
 application, verified platform capabilities, and proposed changes.
 
@@ -220,8 +222,8 @@ is traversed in 100-row pages and produces **all 19,370 unique IDs** in order,
 without duplicates or missing records. This is local SQLite validation, not a
 Nexla connector or Express chat test.
 
-Filtered population statistics are implemented in increment 4 below. Rankings
-and comparisons remain the next query-layer work. Integration authentication,
+Filtered population statistics and rankings are implemented in increments 4 and 5
+below. Comparisons remain the next query-layer work. Integration authentication,
 HTTP validation/OpenAPI, execution deadlines, observability, and production
 packaging remain future increments. The current search limits bound inputs and
 result sizes, **not query duration**; do not expose this service directly as an
@@ -281,7 +283,7 @@ overflowing mean) raise `sqlite3.DataError` rather than silently reporting zero,
 NaN, or infinity. Other storage failures also propagate, never becoming empty
 successful statistics.
 
-The complete local suite now has **194 passing tests**. Statistics coverage
+At the end of increment 4, the local suite had **194 passing tests**. Statistics coverage
 includes every shared filter, literal search, empty/all-null populations, zeros,
 switch handedness, exact group-limit boundaries, binary tie ordering, omitted
 counts, invalid numeric storage, concurrent snapshot consistency, and cleanup
@@ -290,8 +292,85 @@ full-seed and filtered-seed summaries across the supplied **19,370 players**.
 The existing complete seed-pagination and Flask compatibility tests still pass.
 These are local SQLite/Flask results, not Express/Nexla, MCP, or Docker validation.
 
-Rankings and comparisons remain unimplemented. This increment adds no HTTP
-routes, authentication, query deadlines, or environment variables.
+Rankings are implemented in increment 5 below; comparisons remain unimplemented.
+The statistics increment adds no HTTP routes, authentication, query deadlines,
+or environment variables.
+
+### Bounded numeric rankings (increment 5)
+
+`PlayerService.rank_players(metric, filters=None, *, direction="desc", limit=20,
+offset=0)` is an internal Python method, **not an HTTP endpoint or published
+tool**. The required `metric` is exactly `height`, `weight`, or `birthYear`.
+`direction` is exactly `asc` or `desc`, defaulting to `desc`. No performance
+statistics, measurement units, age calculations, or player-quality claims are
+introduced.
+
+```python
+page = service.rank_players(
+    "height",
+    PlayerFilters(birth_country="USA", throws="R"),
+    direction="desc",
+    limit=20,
+    offset=0,
+)
+```
+
+Rankings reuse the same validated `PlayerFilters` as search and statistics.
+Records are ordered numerically by the selected metric, then by `playerId`
+ascending with binary collation **in both directions**. Ties are stable across
+pages for the unchanged seed's unique IDs; no competition/dense rank numbers are
+assigned. Full stored records and nullable fields retain their legacy names and
+types. Zero and fractional measurements remain known numeric values.
+
+| Result field | Implemented meaning |
+| --- | --- |
+| `metric`, `direction` | The selected metric and direction, including the default direction. |
+| `data` | The bounded page of full player records, excluding SQL NULL values of the selected metric. |
+| `pagination` | The same `limit`, `offset`, `total`, and nullable `next_offset` structure as search. Here, `total` counts all **rankable** players in the filtered population, not just this page. |
+| `excluded_count` | Number of players in the entire filtered population with a null selected metric, independently of the page. |
+
+`pagination.total + excluded_count` is the full filtered population size.
+Unknown values are never ranked as zero. An empty population returns no data,
+zero total, and zero exclusions. An all-null population has no ranked data and a
+zero pagination total, but reports all matching players in `excluded_count`.
+Pages beyond the end still report the full counts.
+
+Page limits remain strict integers from 1 through 100 (default 20), and offsets
+from 0 through 100000. Search and rankings share the pagination metadata helper,
+including the cap on `next_offset`; a null next offset can mean the supported
+window is exhausted rather than that every record was returned. Narrow filters
+if the total exceeds that window. Invalid metric/direction values, wrong filter
+types, and invalid page arguments raise before opening a query connection.
+Only fixed, allowlisted columns and directions enter SQL; filter values, limits,
+and offsets are bound parameters.
+
+The population count, null exclusions, metric validation, and page share one
+explicit read transaction. Concurrent writes cannot mix counts or validation
+from one revision with rows from another within a call. Separate requests do
+not promise a snapshot across database refreshes.
+
+The selected metric's extrema are checked across the **entire filtered
+population before pagination**. Nonnumeric or infinite values raise
+`sqlite3.DataError`, even when the offending row would be outside the requested
+page; they are not silently excluded or coerced. Rankings do not compute a mean,
+so large but finite source values do not require a nonoverflowing aggregate.
+Connections close on success and on summary, validation, or page failure;
+storage errors propagate rather than becoming successful empty rankings.
+
+The complete local suite now has **324 passing tests**. Ranking coverage includes
+every supported metric/direction, binary ties across pages and insertion orders,
+all shared filters, literal search, empty/all-null populations, exact page/offset
+limits, invalid numeric storage, concurrent snapshot consistency, and failure
+cleanup. Independent Python sorting verifies complete pagination in all six
+metric/direction combinations over the supplied **19,370 players**, plus a
+filtered seed population. Rankable totals are **18,615** for height, **18,533** for
+weight, and **19,244** for birth year. Legacy Flask responses and the search
+pagination contract remain unchanged. These are local SQLite/Flask results, not
+Express/Nexla, MCP, or Docker validation.
+
+Comparisons, HTTP routes, authentication, deadlines, observability, production
+packaging, and Express/Nexla validation remain future increments. These are local
+service capabilities, not a deployed or externally validated integration.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -358,8 +437,8 @@ recommendation feedback, or Ollama chat as an integration tool.
 ## 4. Proposed application/tool contract
 
 The HTTP contracts in this section are **to be implemented**, not existing routes.
-Internal search/filter and statistics semantics are implemented as described in
-increments 3 and 4.
+Internal search/filter, statistics, and ranking semantics are implemented as
+described in increments 3 through 5.
 Use an opt-in blueprint under `/integrations/express/v1`. The proposed operation
 names are also the desired tool names; Studio's actual generated names and
 schemas must be inspected rather than assumed to match automatically.
@@ -369,7 +448,7 @@ schemas must be inspected rather than assumed to match automatically.
 | `search_players` | `/players` | Search IDs/names and filter by birth country, inclusive birth-year range, bats, and throws. Search and filtering share one query implementation. |
 | `get_player` | `/players/{player_id}` | Retrieve a single record by exact ID; new API returns 404 if absent. |
 | `get_player_statistics` | `/statistics` | Count the filtered population; bounded groups by birth country/bats/throws; count/min/max/mean for birth year, height, and weight. Include known/missing counts. |
-| `rank_players` | `/rankings` | Order by the allowlisted `height`, `weight`, or `birthYear`, with explicit direction and player-ID tie-breaks. Exclude null metric values and report exclusions. No performance-quality claim. |
+| `rank_players` | `/rankings` | Order by the allowlisted `height`, `weight`, or `birthYear`, with `asc`/`desc` direction (default `desc`) and ascending player-ID tie-breaks. Exclude null metrics and report `excluded_count`; pagination totals count rankable players. No performance-quality claim. |
 | `compare_players` | `/comparisons` | Compare 2-5 distinct player IDs in supplied order, showing stored attributes and numeric differences where both values are known. Any missing ID is an explicit error, not a silently incomplete comparison. |
 
 This covers all six requested capabilities with five operations: filtering is a
@@ -386,8 +465,8 @@ Only fixed, allowlisted columns/operations may participate in queries.
   scalar parameters, malformed values, and over-limit input; do not silently
   clamp or substitute defaults for invalid input.
 - Page limits already enforced by the internal search method: default 20,
-  maximum 100; offset 0-100000. Search pages are ordered by `playerId`; add
-  `playerId` as the deterministic ranking tie-breaker.
+  maximum 100; offset 0-100000. Search pages are ordered by `playerId`; rankings
+  already use `playerId` as the deterministic tie-breaker.
   Return `data` plus `pagination.limit`, `offset`, `total`, and nullable
   `next_offset`. Compute totals using the same filters, not from the page length.
 - Aggregates apply to the entire matching population, not just a page. Report
@@ -484,7 +563,8 @@ or document and validate a deliberate compatibility decision.
 | Safe shared data access (**complete**) | Parameterized player/country lookups, deterministic no-match behavior, read-only connections with explicit cleanup, and temporary-database tests. Existing list/detail response contracts retained; regression tests cover quote-containing input and intended legacy missing-ID error behavior. |
 | Bounded player search/filter (**complete**) | Validated shared filters, deterministic pages and snapshot-consistent totals, null/switch-handedness coverage, exact input/page boundaries, and a complete local 19,370-ID seed traversal. Legacy routes unchanged. |
 | Filtered population statistics (**complete**) | Full-population numeric summaries and bounded categorical groups reuse shared filters; explicit missing/omitted counts, one read snapshot, finite-output checks, failure cleanup, and independent full-seed expectations. |
-| Rankings and comparisons (**next query-layer work**) | Reuse shared filters for stable rankings/ties with explicit null exclusions; fixture-backed tests for supported metrics, empty populations, and bounded ordered comparisons. |
+| Bounded numeric rankings (**complete**) | Shared filters and pagination, allowlisted metrics/directions, binary player-ID ties, explicit null exclusions, full-population finite-metric validation, snapshot consistency, failure cleanup, and complete seed traversal in all six metric/direction combinations. |
+| Player comparisons (**next query-layer work**) | Bounded ordered comparisons of 2-5 distinct IDs, explicit absent-ID errors, nullable stored attributes, and numeric differences only where both values are known; fixture-backed and seed-backed tests. |
 | Authenticated integration API and schema | Opt-in routes, fail-closed configuration, strict validation, deadlines, safe errors, and OpenAPI contract tests. Flask test-client tests cover all operations, unauthorized calls, malformed inputs, unavailable/locked storage, and unchanged legacy/Ollama routes (Ollama mocked). |
 | Observability | Correlation IDs across success/failure, redacted structured logs, bounded metrics labels, and counter/latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
@@ -545,7 +625,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3/4 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4/5 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.

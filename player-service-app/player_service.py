@@ -21,6 +21,20 @@ def _validate_integer(name: str, value: int, minimum: int, maximum: int) -> None
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
 
 
+def _pagination(limit: int, offset: int, total: int) -> dict:
+    next_offset = offset + limit
+    return {
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+        "next_offset": (
+            next_offset
+            if next_offset < total and next_offset <= MAX_PAGE_OFFSET
+            else None
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class PlayerFilters:
     q: Optional[str] = None
@@ -139,19 +153,62 @@ class PlayerService:
                 "ORDER BY playerId COLLATE BINARY ASC LIMIT ? OFFSET ?",
                 (*parameters, limit, offset),
             ).fetchall()
-        next_offset = offset + limit
         return {
             "data": [self.convert_row_to_dict(row) for row in rows],
-            "pagination": {
-                "limit": limit,
-                "offset": offset,
-                "total": total,
-                "next_offset": (
-                    next_offset
-                    if next_offset < total and next_offset <= MAX_PAGE_OFFSET
-                    else None
-                ),
-            },
+            "pagination": _pagination(limit, offset, total),
+        }
+
+    def rank_players(
+        self,
+        metric: str,
+        filters: Optional[PlayerFilters] = None,
+        *,
+        direction: str = "desc",
+        limit: int = DEFAULT_PAGE_LIMIT,
+        offset: int = 0,
+    ) -> dict:
+        columns = {"height": "height", "weight": "weight", "birthYear": "birthYear"}
+        directions = {"asc": "ASC", "desc": "DESC"}
+        if not isinstance(metric, str) or metric not in columns:
+            raise ValueError("metric must be one of height, weight, birthYear")
+        if not isinstance(direction, str) or direction not in directions:
+            raise ValueError("direction must be one of asc, desc")
+        where_clause, parameters = self._filter_clause(filters)
+        _validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
+        _validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
+        column = columns[metric]
+        order = directions[direction]
+        ranked_where = (
+            f"{where_clause} AND {column} IS NOT NULL"
+            if where_clause
+            else f" WHERE {column} IS NOT NULL"
+        )
+        with self._read_connection() as conn:
+            # Validate and count the full population in the page's read snapshot.
+            conn.execute("BEGIN")
+            total, known_count, minimum, maximum = conn.execute(
+                f"SELECT COUNT(*), COUNT({column}), MIN({column}), MAX({column}) "
+                f"FROM players{where_clause}",
+                parameters,
+            ).fetchone()
+            if known_count and any(
+                not isinstance(value, (int, float)) or not isfinite(value)
+                for value in (minimum, maximum)
+            ):
+                raise sqlite3.DataError(
+                    f"{metric} rankings require finite numeric values"
+                )
+            rows = conn.execute(
+                f"SELECT * FROM players{ranked_where} "
+                f"ORDER BY {column} {order}, playerId COLLATE BINARY ASC LIMIT ? OFFSET ?",
+                (*parameters, limit, offset),
+            ).fetchall()
+        return {
+            "metric": metric,
+            "direction": direction,
+            "excluded_count": total - known_count,
+            "data": [self.convert_row_to_dict(row) for row in rows],
+            "pagination": _pagination(limit, offset, known_count),
         }
 
     def get_player_statistics(

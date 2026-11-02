@@ -97,6 +97,8 @@ def test_all_reads_close_connections(player_db, tracked_connections):
     service.search_by_country("missing")
     service.search_players()
     service.search_players(offset=100000)
+    service.rank_players("height")
+    service.rank_players("birthYear", limit=1, offset=100000)
     service.get_player_statistics()
     service.get_player_statistics(group_limit=1)
     service.get_columns()
@@ -111,6 +113,7 @@ def test_all_reads_close_connections(player_db, tracked_connections):
         ("search_by_player", ("aaronha01",)),
         ("search_by_country", ("USA",)),
         ("search_players", ()),
+        ("rank_players", ("height",)),
         ("get_player_statistics", ()),
     ],
 )
@@ -128,7 +131,13 @@ def test_failed_queries_raise_and_close_connections(
     assert_connections_closed(tracked_connections)
 
 
-def test_failed_search_page_closes_transaction(player_db, tracked_connections, monkeypatch):
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [("search_players", ()), ("rank_players", ("height",))],
+)
+def test_failed_page_closes_transaction(
+    player_db, tracked_connections, monkeypatch, method, args
+):
     service = PlayerService(player_db)
     connect = sqlite3.connect
 
@@ -144,7 +153,7 @@ def test_failed_search_page_closes_transaction(player_db, tracked_connections, m
     monkeypatch.setattr(sqlite3, "connect", fail_page)
 
     with pytest.raises(sqlite3.OperationalError, match="simulated page failure"):
-        service.search_players()
+        getattr(service, method)(*args)
 
     assert_connections_closed(tracked_connections)
 
@@ -173,14 +182,23 @@ def test_failed_statistics_group_closes_transaction(
     assert_connections_closed(tracked_connections)
 
 
-def test_invalid_statistics_data_closes_transaction(player_db, tracked_connections):
+@pytest.mark.parametrize(
+    ("method", "args", "message"),
+    [
+        ("get_player_statistics", (), "height statistics"),
+        ("rank_players", ("height",), "height rankings"),
+    ],
+)
+def test_invalid_numeric_data_closes_transaction(
+    player_db, tracked_connections, method, args, message
+):
     service = PlayerService(player_db)
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute("UPDATE players SET height = ?", (float("inf"),))
         conn.commit()
 
-    with pytest.raises(sqlite3.DataError, match="height statistics"):
-        service.get_player_statistics()
+    with pytest.raises(sqlite3.DataError, match=message):
+        getattr(service, method)(*args)
 
     assert_connections_closed(tracked_connections)
 

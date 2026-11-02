@@ -12,9 +12,10 @@ closed, with isolated regression coverage and deterministic missing-player handl
 The shared service also supports validated name/ID search, country/year/handedness
 filters, and bounded, deterministic pagination with snapshot-consistent totals.
 Filtered population statistics include known/missing measurement counts and
-bounded categorical summaries from a consistent snapshot. Express-facing
-endpoints, rankings, and comparisons are not implemented yet; existing API
-response formats are unchanged.
+bounded categorical summaries from a consistent snapshot. Numeric rankings
+support height, weight, and birth year with stable ties, bounded pages, and
+explicit missing-value exclusions. Express-facing endpoints and comparisons
+are not implemented yet; existing API response formats are unchanged.
 
 ## Dependencies
 
