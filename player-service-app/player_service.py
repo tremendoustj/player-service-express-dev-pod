@@ -1,6 +1,7 @@
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -11,6 +12,8 @@ DEFAULT_PAGE_LIMIT = 20
 MAX_PAGE_LIMIT = 100
 MAX_PAGE_OFFSET = 100000
 MAX_FILTER_TEXT_LENGTH = 100
+DEFAULT_GROUP_LIMIT = 20
+MAX_GROUP_LIMIT = 100
 
 
 def _validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
@@ -78,7 +81,11 @@ class PlayerService:
             return conn.execute(query, parameters).fetchall()
 
     @staticmethod
-    def _filter_clause(filters: PlayerFilters) -> tuple:
+    def _filter_clause(filters: Optional[PlayerFilters]) -> tuple:
+        if filters is None:
+            filters = PlayerFilters()
+        elif not isinstance(filters, PlayerFilters):
+            raise TypeError("filters must be a PlayerFilters instance")
         conditions = []
         parameters = []
         if filters.q is not None:
@@ -118,13 +125,9 @@ class PlayerService:
         limit: int = DEFAULT_PAGE_LIMIT,
         offset: int = 0,
     ) -> dict:
-        if filters is None:
-            filters = PlayerFilters()
-        elif not isinstance(filters, PlayerFilters):
-            raise TypeError("filters must be a PlayerFilters instance")
+        where_clause, parameters = self._filter_clause(filters)
         _validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
         _validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
-        where_clause, parameters = self._filter_clause(filters)
         with self._read_connection() as conn:
             # COUNT and the page must observe the same SQLite snapshot.
             conn.execute("BEGIN")
@@ -150,6 +153,86 @@ class PlayerService:
                 ),
             },
         }
+
+    def get_player_statistics(
+        self,
+        filters: Optional[PlayerFilters] = None,
+        *,
+        group_limit: int = DEFAULT_GROUP_LIMIT,
+    ) -> dict:
+        where_clause, parameters = self._filter_clause(filters)
+        _validate_integer("group_limit", group_limit, 1, MAX_GROUP_LIMIT)
+        numeric_fields = ("birthYear", "height", "weight")
+        group_fields = ("birthCountry", "bats", "throws")
+        aggregates = ["COUNT(*) AS total"]
+        for field in numeric_fields:
+            aggregates.extend(
+                f"{function}({field}) AS {field}_{name}"
+                for function, name in (
+                    ("COUNT", "known_count"),
+                    ("MIN", "min"),
+                    ("MAX", "max"),
+                    ("AVG", "mean"),
+                )
+            )
+        for field in group_fields:
+            aggregates.extend(
+                (
+                    f"COUNT({field}) AS {field}_known_count",
+                    f"COUNT(DISTINCT {field} COLLATE BINARY) AS {field}_total_groups",
+                )
+            )
+
+        with self._read_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            # Numeric summaries and all groups must describe the same population.
+            conn.execute("BEGIN")
+            summary = conn.execute(
+                f"SELECT {', '.join(aggregates)} FROM players{where_clause}", parameters
+            ).fetchone()
+            total = summary["total"]
+            numeric = {}
+            for field in numeric_fields:
+                known_count = summary[f"{field}_known_count"]
+                measures = {
+                    name: summary[f"{field}_{name}"] for name in ("min", "max", "mean")
+                }
+                if known_count and any(
+                    not isinstance(value, (int, float)) or not isfinite(value)
+                    for value in measures.values()
+                ):
+                    raise sqlite3.DataError(
+                        f"{field} statistics require finite numeric values"
+                    )
+                numeric[field] = {
+                    "known_count": known_count,
+                    "missing_count": total - known_count,
+                    **measures,
+                }
+            groups = {}
+            for field in group_fields:
+                group_where = (
+                    f"{where_clause} AND {field} IS NOT NULL"
+                    if where_clause
+                    else f" WHERE {field} IS NOT NULL"
+                )
+                rows = conn.execute(
+                    f"SELECT {field} AS value, COUNT(*) AS count FROM players{group_where} "
+                    f"GROUP BY {field} COLLATE BINARY "
+                    f"ORDER BY count DESC, {field} COLLATE BINARY ASC LIMIT ?",
+                    (*parameters, group_limit),
+                ).fetchall()
+                known_count = summary[f"{field}_known_count"]
+                groups[field] = {
+                    "data": [dict(row) for row in rows],
+                    "known_count": known_count,
+                    "missing_count": total - known_count,
+                    "total_groups": summary[f"{field}_total_groups"],
+                    "limit": group_limit,
+                    "other_count": known_count - sum(row["count"] for row in rows),
+                }
+
+        return {"total": total, "numeric": numeric, "groups": groups}
 
     def get_all_players(self):
         result = self._fetchall("SELECT * FROM players")

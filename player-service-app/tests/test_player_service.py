@@ -97,6 +97,8 @@ def test_all_reads_close_connections(player_db, tracked_connections):
     service.search_by_country("missing")
     service.search_players()
     service.search_players(offset=100000)
+    service.get_player_statistics()
+    service.get_player_statistics(group_limit=1)
     service.get_columns()
 
     assert_connections_closed(tracked_connections)
@@ -109,6 +111,7 @@ def test_all_reads_close_connections(player_db, tracked_connections):
         ("search_by_player", ("aaronha01",)),
         ("search_by_country", ("USA",)),
         ("search_players", ()),
+        ("get_player_statistics", ()),
     ],
 )
 def test_failed_queries_raise_and_close_connections(
@@ -142,6 +145,42 @@ def test_failed_search_page_closes_transaction(player_db, tracked_connections, m
 
     with pytest.raises(sqlite3.OperationalError, match="simulated page failure"):
         service.search_players()
+
+    assert_connections_closed(tracked_connections)
+
+
+@pytest.mark.parametrize("field", ["birthCountry", "bats", "throws"])
+def test_failed_statistics_group_closes_transaction(
+    player_db, tracked_connections, monkeypatch, field
+):
+    service = PlayerService(player_db)
+    connect = sqlite3.connect
+
+    class FailingGroupConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql.startswith(f"SELECT {field} AS value"):
+                raise sqlite3.OperationalError("simulated group failure")
+            return super().execute(sql, parameters)
+
+    def fail_group(*args, **kwargs):
+        return connect(*args, factory=FailingGroupConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", fail_group)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated group failure"):
+        service.get_player_statistics()
+
+    assert_connections_closed(tracked_connections)
+
+
+def test_invalid_statistics_data_closes_transaction(player_db, tracked_connections):
+    service = PlayerService(player_db)
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("UPDATE players SET height = ?", (float("inf"),))
+        conn.commit()
+
+    with pytest.raises(sqlite3.DataError, match="height statistics"):
+        service.get_player_statistics()
 
     assert_connections_closed(tracked_connections)
 

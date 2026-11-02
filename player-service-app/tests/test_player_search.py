@@ -1,10 +1,8 @@
-import csv
 import sqlite3
 from contextlib import closing
 
 import pytest
 
-from app_paths import PLAYER_CSV
 from player_service import PlayerFilters, PlayerService
 
 
@@ -304,24 +302,10 @@ def test_next_offset_never_exceeds_supported_cap(service, player_db):
     assert service.search_players(limit=2, offset=99999)["pagination"]["next_offset"] is None
 
 
-def test_complete_repository_seed_pagination(service, player_db):
-    with PLAYER_CSV.open(encoding="utf-8-sig", newline="") as csv_file:
-        reader = csv.DictReader(csv_file)
-        assert reader.fieldnames == service.columns
-        records = list(reader)
-    expected_ids = sorted(record["playerId"] for record in records)
+def test_complete_repository_seed_pagination(service, seed_player_records):
+    assert list(seed_player_records[0]) == service.columns
+    expected_ids = sorted(record["playerId"] for record in seed_player_records)
     assert len(expected_ids) == len(set(expected_ids)) == 19370
-    placeholders = ", ".join("?" for _ in service.columns)
-    with closing(sqlite3.connect(player_db)) as conn:
-        conn.execute("DELETE FROM players")
-        conn.executemany(
-            f"INSERT INTO players VALUES ({placeholders})",
-            [
-                tuple(record[column] or None for column in service.columns)
-                for record in records
-            ],
-        )
-        conn.commit()
 
     default_page = service.search_players()
     assert len(default_page["data"]) == 20

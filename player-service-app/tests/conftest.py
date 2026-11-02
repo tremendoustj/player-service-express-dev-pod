@@ -1,7 +1,10 @@
+import csv
 import sqlite3
 from contextlib import closing
 
 import pytest
+
+from app_paths import PLAYER_CSV
 
 
 PLAYER_COLUMNS = (
@@ -109,6 +112,26 @@ def player_db(tmp_path, player_records):
         )
         conn.commit()
     return db_path
+
+
+@pytest.fixture
+def seed_player_records(player_db):
+    with PLAYER_CSV.open(encoding="utf-8-sig", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        assert reader.fieldnames == list(PLAYER_COLUMNS)
+        records = [
+            {column: value or None for column, value in record.items()}
+            for record in reader
+        ]
+    placeholders = ", ".join("?" for _ in PLAYER_COLUMNS)
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.executemany(
+            f"INSERT INTO players VALUES ({placeholders})",
+            [tuple(record[column] for column in PLAYER_COLUMNS) for record in records],
+        )
+        conn.commit()
+    return records
 
 
 @pytest.fixture

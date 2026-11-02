@@ -2,14 +2,15 @@
 
 Assessment date: 2026-11-02.
 
-**Status: shared data access and bounded search/filter primitives implemented;
-Express API pending.** Player/country lookups are parameterized, reads explicitly
-close their read-only SQLite connections, and missing-player handling has
-regression coverage. Internal search supports validated filters and deterministic
-pagination. No integration endpoints, authentication, observability, or MCP server
-are implemented yet. No infrastructure was deployed and no Nexla resources were
-created. This document distinguishes the existing application, verified platform
-capabilities, and proposed changes.
+**Status: shared data access, bounded search/filter, and population statistics
+implemented; Express API pending.** Player/country lookups are parameterized,
+reads explicitly close their read-only SQLite connections, and missing-player
+handling has regression coverage. Internal search supports validated filters and
+deterministic pagination; statistics reuse those filters and explicitly report
+missing values and omitted groups. No integration endpoints, authentication,
+observability, or MCP server are implemented yet. No infrastructure was deployed
+and no Nexla resources were created. This document distinguishes the existing
+application, verified platform capabilities, and proposed changes.
 
 ## 1. Repository assessment
 
@@ -211,7 +212,7 @@ even if `total` is larger. Full-scan clients must compare collected rows with
 `total` and narrow filters if the supported window is insufficient; a null next
 offset alone does not prove a complete scan of an arbitrarily large population.
 
-The complete local suite now has **128 passing tests**. Coverage includes literal
+At the end of increment 3, the local suite had **128 passing tests**. Coverage includes literal
 search and case behavior, combined filters, nulls, switch handedness, strict
 validation, exact page/offset caps, ordering, concurrent snapshot consistency,
 and connection cleanup on failure. A temporary database seeded from `Player.csv`
@@ -219,11 +220,78 @@ is traversed in 100-row pages and produces **all 19,370 unique IDs** in order,
 without duplicates or missing records. This is local SQLite validation, not a
 Nexla connector or Express chat test.
 
-Full-population statistics, rankings, and comparisons are the next query-layer
-increment. Integration authentication, HTTP validation/OpenAPI, execution
-deadlines, observability, and production packaging remain future increments.
-The current search limits bound inputs and result sizes, **not query duration**;
-do not expose this service directly as an unauthenticated integration.
+Filtered population statistics are implemented in increment 4 below. Rankings
+and comparisons remain the next query-layer work. Integration authentication,
+HTTP validation/OpenAPI, execution deadlines, observability, and production
+packaging remain future increments. The current search limits bound inputs and
+result sizes, **not query duration**; do not expose this service directly as an
+unauthenticated integration.
+
+### Filtered population statistics (increment 4)
+
+`PlayerService.get_player_statistics(filters=None, *, group_limit=20)` is an
+internal Python method, **not an HTTP endpoint or published tool**. It reuses the
+same validated `PlayerFilters` and parameterized filter builder as search. All
+statistics describe the **entire filtered population**, independently of search
+pagination or the categorical group limit.
+
+The result has three top-level fields:
+
+| Field | Implemented contents |
+| --- | --- |
+| `total` | Number of matching players, including players with missing attributes. |
+| `numeric` | Summaries keyed by `birthYear`, `height`, and `weight`; each has `known_count`, `missing_count`, `min`, `max`, and `mean`. |
+| `groups` | Summaries keyed by `birthCountry`, `bats`, and `throws`; each has `data`, `known_count`, `missing_count`, `total_groups`, `limit`, and `other_count`. |
+
+Numeric summaries exclude SQL NULL values from the mean and extrema. Zero is a
+known value, not missing. When no values are known, `min`, `max`, and `mean` are
+null, not zero. An empty population has `total=0`, zero known/missing counts,
+null numeric measures, and empty group arrays. The values retain the source's
+meaning; no measurement units, performance statistics, or current-season claims
+are introduced.
+
+Each group's `data` contains `{"value": <stored value>, "count": <player count>}`
+objects ordered by count descending, then exact value ascending using binary
+collation. Grouping is case-sensitive and does not normalize source values.
+SQL NULL is reported separately in `missing_count`, never replaced by a synthetic
+"Unknown" category or counted toward the group limit. A stored empty string or
+literal "Unknown" remains a distinct known value.
+
+`group_limit` is a strict integer from 1 through 100 (default 20), applied
+independently to each categorical field. Booleans, numeric strings, floats, and
+out-of-range values raise `ValueError` before opening a query connection.
+`total_groups` counts all distinct non-null values, even when only some are
+returned. `other_count` counts players in omitted non-null groups, not the number
+of omitted groups. For each field:
+
+- `known_count + missing_count = total`.
+- `sum(data[*].count) + other_count = known_count`.
+
+A positive `other_count` explicitly signals a truncated distribution. There is
+no group offset pagination; callers can raise the limit or narrow filters.
+Using `group_limit=100` returns all 55 known birth-country groups in the current
+seed, but does not promise complete distributions for arbitrary larger datasets.
+
+The numeric/count query and the three bounded group queries share one explicit
+read transaction. They therefore observe the same SQLite snapshot even if a
+concurrent WAL writer commits between queries. Only fixed field names enter the
+SQL; filter values and the group limit are bound parameters. Connections close
+on success and failure. Invalid/nonfinite numeric summaries (including an
+overflowing mean) raise `sqlite3.DataError` rather than silently reporting zero,
+NaN, or infinity. Other storage failures also propagate, never becoming empty
+successful statistics.
+
+The complete local suite now has **194 passing tests**. Statistics coverage
+includes every shared filter, literal search, empty/all-null populations, zeros,
+switch handedness, exact group-limit boundaries, binary tie ordering, omitted
+counts, invalid numeric storage, concurrent snapshot consistency, and cleanup
+after failures at each query stage. Independent Python calculations verify
+full-seed and filtered-seed summaries across the supplied **19,370 players**.
+The existing complete seed-pagination and Flask compatibility tests still pass.
+These are local SQLite/Flask results, not Express/Nexla, MCP, or Docker validation.
+
+Rankings and comparisons remain unimplemented. This increment adds no HTTP
+routes, authentication, query deadlines, or environment variables.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -290,7 +358,8 @@ recommendation feedback, or Ollama chat as an integration tool.
 ## 4. Proposed application/tool contract
 
 The HTTP contracts in this section are **to be implemented**, not existing routes.
-Internal search/filter semantics are implemented as described in increment 3.
+Internal search/filter and statistics semantics are implemented as described in
+increments 3 and 4.
 Use an opt-in blueprint under `/integrations/express/v1`. The proposed operation
 names are also the desired tool names; Studio's actual generated names and
 schemas must be inspected rather than assumed to match automatically.
@@ -414,7 +483,8 @@ or document and validate a deliberate compatibility decision.
 | Assessment (this document) | Repository/data inventory, official-source decision, and existing pytest baseline recorded. No runtime behavior changed. |
 | Safe shared data access (**complete**) | Parameterized player/country lookups, deterministic no-match behavior, read-only connections with explicit cleanup, and temporary-database tests. Existing list/detail response contracts retained; regression tests cover quote-containing input and intended legacy missing-ID error behavior. |
 | Bounded player search/filter (**complete**) | Validated shared filters, deterministic pages and snapshot-consistent totals, null/switch-handedness coverage, exact input/page boundaries, and a complete local 19,370-ID seed traversal. Legacy routes unchanged. |
-| Player analytics and comparisons (**next increment**) | Reuse the shared filters for full-population aggregates and rankings; fixture-backed tests for known/missing values, empty populations, stable rankings/ties, null exclusions, and bounded ordered comparisons. |
+| Filtered population statistics (**complete**) | Full-population numeric summaries and bounded categorical groups reuse shared filters; explicit missing/omitted counts, one read snapshot, finite-output checks, failure cleanup, and independent full-seed expectations. |
+| Rankings and comparisons (**next query-layer work**) | Reuse shared filters for stable rankings/ties with explicit null exclusions; fixture-backed tests for supported metrics, empty populations, and bounded ordered comparisons. |
 | Authenticated integration API and schema | Opt-in routes, fail-closed configuration, strict validation, deadlines, safe errors, and OpenAPI contract tests. Flask test-client tests cover all operations, unauthorized calls, malformed inputs, unavailable/locked storage, and unchanged legacy/Ollama routes (Ollama mocked). |
 | Observability | Correlation IDs across success/failure, redacted structured logs, bounded metrics labels, and counter/latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
@@ -475,7 +545,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2/3 test
+**End-to-end integration is not complete.** The baseline and increment-2/3/4 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.

@@ -11,7 +11,9 @@ requirements. Shared SQLite reads are now parameterized, read-only, and explicit
 closed, with isolated regression coverage and deterministic missing-player handling.
 The shared service also supports validated name/ID search, country/year/handedness
 filters, and bounded, deterministic pagination with snapshot-consistent totals.
-Express-facing endpoints and analytics are not implemented yet; existing API
+Filtered population statistics include known/missing measurement counts and
+bounded categorical summaries from a consistent snapshot. Express-facing
+endpoints, rankings, and comparisons are not implemented yet; existing API
 response formats are unchanged.
 
 ## Dependencies
