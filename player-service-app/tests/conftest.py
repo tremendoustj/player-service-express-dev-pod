@@ -1,4 +1,5 @@
 import csv
+import secrets
 import sqlite3
 from contextlib import closing
 
@@ -154,6 +155,7 @@ def client(player_db, monkeypatch):
     import player_service
 
     # App import seeds a database, so redirect its path before importing it.
+    monkeypatch.setenv("PLAYER_INTEGRATION_ENABLED", "false")
     monkeypatch.setattr(app_paths, "PLAYER_DB", player_db)
     monkeypatch.setattr(player_service, "PLAYER_DB", player_db)
     import app as app_module
@@ -162,3 +164,32 @@ def client(player_db, monkeypatch):
     monkeypatch.setitem(app_module.app.config, "TESTING", True)
     with app_module.app.test_client() as client:
         yield client
+
+
+@pytest.fixture
+def express_token():
+    return secrets.token_urlsafe(32)
+
+
+@pytest.fixture
+def express_app(client, monkeypatch, express_token):
+    import app as app_module
+
+    monkeypatch.setenv("PLAYER_INTEGRATION_ENABLED", "true")
+    monkeypatch.setenv("PLAYER_INTEGRATION_TOKEN", express_token)
+    monkeypatch.delenv("PLAYER_DB_BUSY_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("PLAYER_QUERY_TIMEOUT_SECONDS", raising=False)
+    application = app_module.create_app()
+    application.config["TESTING"] = True
+    return application
+
+
+@pytest.fixture
+def express_client(express_app):
+    with express_app.test_client() as client:
+        yield client
+
+
+@pytest.fixture
+def express_headers(express_token):
+    return {"Authorization": f"Bearer {express_token}"}

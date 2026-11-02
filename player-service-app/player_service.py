@@ -24,12 +24,12 @@ MAX_DB_TIMEOUT_SECONDS = 60.0
 _PROGRESS_HANDLER_STEPS = 1000
 
 
-def _validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
+def validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
 
 
-def _validate_timeout(name: str, value: float, minimum: float) -> None:
+def validate_db_timeout(name: str, value: float, minimum: float) -> None:
     if type(value) not in (int, float) or not minimum <= value <= MAX_DB_TIMEOUT_SECONDS:
         raise ValueError(
             f"{name} must be a finite number between "
@@ -116,7 +116,7 @@ class PlayerFilters:
             ("birth_year_max", self.birth_year_max),
         ):
             if value is not None:
-                _validate_integer(name, value, 1, 9999)
+                validate_integer(name, value, 1, 9999)
         if (
             self.birth_year_min is not None
             and self.birth_year_max is not None
@@ -141,9 +141,9 @@ class PlayerService:
         busy_timeout_seconds: float = DEFAULT_BUSY_TIMEOUT_SECONDS,
         query_timeout_seconds: Optional[float] = None,
     ):
-        _validate_timeout("busy_timeout_seconds", busy_timeout_seconds, 0)
+        validate_db_timeout("busy_timeout_seconds", busy_timeout_seconds, 0)
         if query_timeout_seconds is not None:
-            _validate_timeout(
+            validate_db_timeout(
                 "query_timeout_seconds",
                 query_timeout_seconds,
                 MIN_QUERY_TIMEOUT_SECONDS,
@@ -239,8 +239,8 @@ class PlayerService:
         offset: int = 0,
     ) -> dict:
         where_clause, parameters = self._filter_clause(filters)
-        _validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
-        _validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
+        validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
+        validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
         with self._read_connection() as conn:
             # COUNT and the page must observe the same SQLite snapshot.
             conn.execute("BEGIN")
@@ -273,8 +273,8 @@ class PlayerService:
         if not isinstance(direction, str) or direction not in directions:
             raise ValueError("direction must be one of asc, desc")
         where_clause, parameters = self._filter_clause(filters)
-        _validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
-        _validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
+        validate_integer("limit", limit, 1, MAX_PAGE_LIMIT)
+        validate_integer("offset", offset, 0, MAX_PAGE_OFFSET)
         column = columns[metric]
         order = directions[direction]
         ranked_where = (
@@ -317,7 +317,7 @@ class PlayerService:
         group_limit: int = DEFAULT_GROUP_LIMIT,
     ) -> dict:
         where_clause, parameters = self._filter_clause(filters)
-        _validate_integer("group_limit", group_limit, 1, MAX_GROUP_LIMIT)
+        validate_integer("group_limit", group_limit, 1, MAX_GROUP_LIMIT)
         numeric_fields = ("birthYear", "height", "weight")
         group_fields = ("birthCountry", "bats", "throws")
         aggregates = ["COUNT(*) AS total"]

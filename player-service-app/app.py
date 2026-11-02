@@ -4,9 +4,8 @@ from flask import Flask, jsonify
 from sqlalchemy import create_engine
 
 from app_paths import PLAYER_CSV, PLAYER_DB
+from express_api import configure_express_api
 from player_service import PlayerService
-
-app = Flask(__name__)
 
 
 def ensure_player_db() -> None:
@@ -17,17 +16,12 @@ def ensure_player_db() -> None:
     df.to_sql("players", con=engine, if_exists="replace", index=False)
 
 
-ensure_player_db()
-
-
-@app.route("/v1/players", methods=["GET"])
 def get_players():
     player_service = PlayerService()
     result = player_service.get_all_players()
     return result
 
 
-@app.route("/v1/players/<string:player_id>")
 def query_player_id(player_id):
     player_service = PlayerService()
     result = player_service.search_by_player(player_id)
@@ -38,7 +32,6 @@ def query_player_id(player_id):
         return jsonify(result)
 
 
-@app.route("/v1/chat/list-models")
 def list_models():
     try:
         return jsonify(ollama.list())
@@ -51,7 +44,6 @@ def list_models():
         ), 503
 
 
-@app.route("/v1/chat", methods=["POST"])
 def chat():
     try:
         response = ollama.chat(
@@ -71,6 +63,20 @@ def chat():
                 "detail": str(exc),
             }
         ), 503
+
+
+def create_app() -> Flask:
+    application = Flask(__name__)
+    configure_express_api(application)
+    ensure_player_db()
+    application.add_url_rule("/v1/players", view_func=get_players, methods=["GET"])
+    application.add_url_rule("/v1/players/<string:player_id>", view_func=query_player_id)
+    application.add_url_rule("/v1/chat/list-models", view_func=list_models)
+    application.add_url_rule("/v1/chat", view_func=chat, methods=["POST"])
+    return application
+
+
+app = create_app()
 
 
 if __name__ == "__main__":
