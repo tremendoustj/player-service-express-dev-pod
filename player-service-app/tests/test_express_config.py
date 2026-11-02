@@ -142,8 +142,9 @@ def test_bad_configuration_fails_before_database_initialization(
         app.create_app()
 
 
-def test_default_app_has_no_integration_routes_or_headers(client):
-    response = client.get(API_PREFIX + "/players")
+@pytest.mark.parametrize("path", ["/players", "/players/aaronha01"])
+def test_default_app_has_no_integration_routes_or_headers(client, path):
+    response = client.get(API_PREFIX + path)
     assert response.status_code == 404
     assert not response.is_json
     assert "X-Request-ID" not in response.headers

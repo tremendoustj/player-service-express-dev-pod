@@ -1,14 +1,14 @@
-# Express integration API: authenticated search
+# Express integration API: authenticated search and details
 
-**Status: the opt-in search/filter endpoint is implemented and locally tested.**
-Player details, statistics, rankings, comparisons, and the OpenAPI contract are
+**Status: opt-in search/filter and player-detail endpoints are implemented and
+locally tested.** Statistics, rankings, comparisons, and the OpenAPI contract are
 not yet exposed through this API. Their shared service methods already exist.
 Metrics, production packaging, real loopback HTTP smoke tests, and authenticated
 Express/Nexla validation remain pending.
 
 The [architecture assessment](express-integration-architecture.md) records the
 verified platform mechanisms, integration decision, remaining acceptance gates,
-and external blockers. This endpoint is not a published MCP server or proof of
+and external blockers. These endpoints are not a published MCP server or proof of
 a working Express chat integration.
 
 ## Configuration
@@ -79,9 +79,9 @@ server, and private storage. Those deployment gates are not implemented or
 validated by this increment. Never expose the legacy routes, SQLite, Ollama,
 debugger, or model service to make the connector work.
 
-## Search and filtering
+## Authentication
 
-`GET /integrations/express/v1/players` requires
+Search and player-detail requests require
 `Authorization: Bearer <application token>`. The scheme is case-insensitive;
 the token is case-sensitive. Use exactly one space between scheme and token.
 Malformed, duplicate, missing, or incorrect credentials receive the same 401
@@ -92,6 +92,10 @@ the entire `/integrations/express/v1` namespace, including unknown URLs and
 unsupported methods. Flask's automatic HEAD and OPTIONS methods are also
 authenticated. HEAD performs the bounded read but returns no body; OPTIONS
 does not query the database. No CORS access is enabled.
+
+## Search and filtering
+
+`GET /integrations/express/v1/players` accepts the following parameters:
 
 | Query parameter | Semantics |
 | --- | --- |
@@ -145,12 +149,51 @@ collected count to `total` and narrow filters if necessary. Separate page
 requests do not promise consistency across a later database refresh.
 
 The existing service performs parameterized, read-only SQLite reads and closes
-connections on success and failure. Both schema inspection and the search read
+connections on success and failure. Both schema inspection and the operation read
 use configured deadlines, but **each has its own budget**. These cooperative
 SQLite deadlines are not a hard total HTTP timeout; response conversion,
 serialization, and blocked filesystem operations require separate production
 controls. Nonfinite numeric values or unserializable stored values return a
 storage error, not a successful nonstandard `Infinity`/`NaN` JSON response.
+
+## Player details
+
+`GET /integrations/express/v1/players/{player_id}` retrieves one player by exact
+ID, for example `/integrations/express/v1/players/aaronha01`. It uses the same
+authentication, request-size/body restrictions, SQLite deadlines, safe JSON
+serialization, correlation headers, and no-store policy as search.
+
+The decoded ID must contain **1-32 ASCII alphanumeric characters**. Matching is
+case-sensitive using SQLite binary collation, even if the stored column uses a
+different collation. IDs are not trimmed, case-normalized, or coerced. Percent
+encoding of valid ASCII characters is accepted, but is not decoded a second time.
+Invalid IDs return 400 before any database access. An embedded slash, such as
+`a%2Fb`, is decoded before Flask routing and creates extra path segments. This
+returns a routing 404 instead; authentication still precedes that response.
+
+No query parameters are supported: **any nonempty query string returns 400**,
+including search filters, pagination, duplicate parameters, or malformed pairs.
+The namespace's 4096-byte encoded-query cap still applies first after
+authentication. HEAD performs the same validated read without a response body;
+automatic OPTIONS is authenticated and performs no database read.
+
+A successful response contains exactly `data` and `request_id`. Unlike search,
+`data` is a **single object**, not an array: the full stored record with the same
+24 fields, types, and nullable values as the legacy service. There is no
+pagination. An absent, well-formed ID returns 404 with code `player_not_found`,
+not an empty object or an HTTP-200 error. The error message does not echo the ID.
+
+`PlayerService.get_player()` shares ID validation with comparisons and uses one
+parameterized, read-only SELECT. It retrieves at most **two rows**, allowing it
+to detect duplicate stored IDs in the current schema without an unbounded fetch.
+Duplicate selected IDs return 503 `storage_unavailable`, never an arbitrary
+record. Invalid or duplicate records outside the selection do not block the
+lookup. All operation connections close on success or failure.
+
+The existing `/v1/players/{player_id}` route is unchanged: it still accepts its
+legacy ID inputs, returns a bare record on success, and retains its HTTP-200
+missing-player error. The stricter bounds and 404 contract apply only to the
+integration detail operation.
 
 ## Errors and correlation
 
@@ -170,10 +213,11 @@ All integration JSON errors use this envelope:
 | --- | --- | --- |
 | 400 | `invalid_request` | Invalid, ambiguous, or unsupported input, including a GET/HEAD body. |
 | 401 | `unauthorized` | Missing, malformed, or incorrect application credential. |
-| 404 | `not_found` | No implemented route at this URL; detail and analytics URLs are still unavailable. |
+| 404 | `not_found` | No implemented route at this URL; analytics URLs remain unavailable. |
+| 404 | `player_not_found` | The well-formed requested player ID does not exist. |
 | 405 | `method_not_allowed` | Unsupported method; the response preserves the `Allow` header. |
 | 414 | `request_too_large` | Encoded query string exceeds 4096 bytes. |
-| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values. |
+| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values or duplicate selected detail IDs. |
 | 504 | `query_timeout` | Database read deadline exceeded. |
 | 500 | `internal_error` | Unexpected failure, with sanitized diagnostics in the request log. |
 
@@ -191,8 +235,10 @@ the header, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`.
 Request logs use a JSON message with UTC timestamp, fixed operation/route
 template, status, duration, request ID, result count, error code, and exception
 class where applicable. Unknown routes use the literal `unmatched`, not the raw
-path. Tokens, request/query/body contents, player records, SQL, and exception
-messages/tracebacks are excluded. Successes use INFO and failures use WARNING
+path. Detail requests log a fixed route template, not the player ID, and report
+one result on success or zero on failure. Tokens, request/query/body contents,
+player records, SQL, and exception messages/tracebacks are excluded. Successes
+use INFO and failures use WARNING
 on Flask's application logger; configure logging to retain INFO when deploying.
 Production log-handler formatting and operational metrics are still pending.
 Web server/proxy access logs are separate and may include raw URIs; disable or
@@ -224,11 +270,14 @@ source player-service-app/.venv/bin/activate
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
 
-The complete local suite passes **721 tests**. Coverage includes disabled/invalid
+The complete local suite passes **839 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
 nonfinite-output rejection, and complete authenticated Flask test-client
-pagination over **19,370 unique seed IDs**. Legacy player responses and mocked
+pagination over **19,370 unique seed IDs**. Detail coverage includes exact
+ID/length/case boundaries, malformed encoded paths, rejected query inputs,
+missing/duplicate records, bounded retrieval, and independent CSV expectations
+for seed records with nullable fields. Legacy player responses and mocked
 Ollama success/failure behavior are retained. Flask test-client coverage is not
 a real network, container, live Ollama, or Express/Nexla end-to-end result.

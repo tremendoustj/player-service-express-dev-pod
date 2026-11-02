@@ -85,6 +85,7 @@ def test_timeout_boundaries_are_accepted(
         ("get_all_players", (), {}),
         ("search_by_player", ("aaronha01",), {}),
         ("search_by_player", ("missing",), {}),
+        ("get_player", ("aaronha01",), {}),
         ("search_by_country", ("C\u00f4te d'Ivoire",), {}),
         ("search_players", (), {}),
         (
@@ -251,6 +252,7 @@ def test_statements_share_one_budget_and_shrink_the_lock_wait(
         ("get_columns", ()),
         ("get_all_players", ()),
         ("search_by_player", ("aaronha01",)),
+        ("get_player", ("aaronha01",)),
         ("search_by_country", ("USA",)),
         ("search_players", ()),
         ("rank_players", ("height",)),
@@ -415,6 +417,7 @@ def test_bounded_repository_seed_reads_match_legacy(player_db, seed_player_recor
     operations = [
         ("search_players", (), {"limit": 100}),
         ("search_by_player", ("aaronha01",), {}),
+        ("get_player", ("aaronha01",), {}),
         ("get_player_statistics", (), {"group_limit": 100}),
         ("rank_players", ("height",), {"limit": 100}),
         ("compare_players", (["aaronha01", "aaronto01"],), {}),

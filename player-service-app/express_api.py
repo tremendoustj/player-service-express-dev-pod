@@ -21,9 +21,11 @@ from player_service import (
     MIN_QUERY_TIMEOUT_SECONDS,
     PlayerFilters,
     PlayerQueryTimeoutError,
+    PlayersNotFoundError,
     PlayerService,
     validate_db_timeout,
     validate_integer,
+    validate_player_id,
 )
 
 
@@ -170,6 +172,22 @@ def configure_express_api(app: Flask) -> None:
         return
     api = Blueprint("express_integration", __name__, url_prefix=API_PREFIX)
 
+    def player_service() -> PlayerService:
+        return PlayerService(
+            busy_timeout_seconds=settings.busy_timeout_seconds,
+            query_timeout_seconds=settings.query_timeout_seconds,
+        )
+
+    def success_response(result: dict, *, result_count: int) -> Response:
+        try:
+            body = app.json.dumps(
+                {**result, "request_id": g.express_request_id}, allow_nan=False
+            )
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.DataError("Player data must be valid JSON") from exc
+        g.express_result_count = result_count
+        return app.response_class(body, mimetype="application/json")
+
     @app.before_request
     def prepare_express_request():
         if not _in_integration_scope():
@@ -200,19 +218,26 @@ def configure_express_api(app: Flask) -> None:
             filters, limit, offset = _search_arguments()
         except ValueError as exc:
             return _error(400, "invalid_request", str(exc))
-        service = PlayerService(
-            busy_timeout_seconds=settings.busy_timeout_seconds,
-            query_timeout_seconds=settings.query_timeout_seconds,
-        )
-        result = service.search_players(filters, limit=limit, offset=offset)
+        result = player_service().search_players(filters, limit=limit, offset=offset)
+        return success_response(result, result_count=len(result["data"]))
+
+    @api.get("/players/<string:player_id>")
+    def get_player(player_id: str):
         try:
-            body = app.json.dumps(
-                {**result, "request_id": g.express_request_id}, allow_nan=False
-            )
-        except (TypeError, ValueError) as exc:
-            raise sqlite3.DataError("Player data must be valid JSON") from exc
-        g.express_result_count = len(result["data"])
-        return app.response_class(body, mimetype="application/json")
+            validate_player_id(player_id)
+            if request.query_string:
+                raise ValueError("Query parameters are not supported")
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
+        result = player_service().get_player(player_id)
+        return success_response({"data": result}, result_count=1)
+
+    @api.errorhandler(PlayersNotFoundError)
+    def players_not_found(exc):
+        g.express_exception_type = type(exc).__name__
+        return _error(
+            404, "player_not_found", "One or more requested players were not found"
+        )
 
     @api.errorhandler(PlayerQueryTimeoutError)
     def query_timeout(exc):

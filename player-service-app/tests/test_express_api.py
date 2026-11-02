@@ -14,6 +14,8 @@ from player_service import PlayerQueryTimeoutError, PlayerService
 
 
 PLAYERS_URL = API_PREFIX + "/players"
+DETAIL_URL = PLAYERS_URL + "/aaronha01"
+DETAIL_ROUTE = PLAYERS_URL + "/<string:player_id>"
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +39,10 @@ def assert_error(response, status, code):
     assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
-@pytest.mark.parametrize("path", [API_PREFIX, PLAYERS_URL, API_PREFIX + "/unknown"])
+@pytest.mark.parametrize(
+    "path",
+    [API_PREFIX, PLAYERS_URL, DETAIL_URL, PLAYERS_URL + "/bad-id", API_PREFIX + "/unknown"],
+)
 @pytest.mark.parametrize("method", ["GET", "OPTIONS", "POST", "DELETE"])
 def test_authentication_precedes_routing_and_validation(
     express_client, tracked_connections, path, method
@@ -143,6 +148,141 @@ def test_search_response_preserves_records_and_pagination(
     assert str(UUID(payload["request_id"])) == response.headers["X-Request-ID"]
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+@pytest.mark.parametrize("record_index", [0, 1, 3])
+def test_detail_response_preserves_record_shape_and_nulls(
+    express_client, express_headers, player_records, record_index
+):
+    expected = player_records[record_index]
+    response = express_client.get(
+        PLAYERS_URL + "/" + expected["playerId"],
+        headers={**express_headers, "X-Request-ID": "detail-123"},
+    )
+
+    assert response.status_code == 200
+    assert response.is_json
+    assert response.get_json() == {"data": expected, "request_id": "detail-123"}
+    assert response.headers["X-Request-ID"] == "detail-123"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+@pytest.mark.parametrize("player_id", ["a", "A", "9", "Ab09" * 8])
+def test_detail_accepts_exact_id_boundaries(
+    express_client, express_headers, player_db, player_records, player_id
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("INSERT INTO players (playerId) VALUES (?)", (player_id,))
+        conn.commit()
+    expected = dict.fromkeys(player_records[0])
+    expected["playerId"] = player_id
+
+    response = express_client.get(
+        PLAYERS_URL + "/" + player_id, headers=express_headers
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["data"] == expected
+
+
+def test_detail_accepts_percent_encoded_ascii_id(
+    express_client, express_headers, player_records
+):
+    response = express_client.get(
+        PLAYERS_URL + "/%61aronha01", headers=express_headers
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["data"] == player_records[0]
+
+
+@pytest.mark.parametrize(
+    "segment",
+    [
+        "a" * 33,
+        "%20",
+        "aaronha01%20",
+        "aaronha01%0A",
+        "a%00b",
+        "a%09b",
+        "a_b",
+        "a-b",
+        "quote%2701",
+        "%C3%A9",
+        "%EF%BC%A1",
+        "%D9%A1",
+        "%",
+        "%GG",
+        "%FF",
+        "%C0%AF",
+        "%2561aronha01",
+        "aaronha01%27%20OR%201%3D1%20--",
+    ],
+)
+def test_invalid_detail_ids_fail_before_any_database_access(
+    express_client, express_headers, tracked_connections, segment
+):
+    response = express_client.get(
+        PLAYERS_URL + "/" + segment, headers=express_headers
+    )
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+@pytest.mark.parametrize(
+    "query", ["q=Aaron", "limit=1", "unknown=secret", "a=1&a=2", "q", "&", "%", "q=%FF"]
+)
+def test_detail_rejects_all_nonempty_query_strings(
+    express_client, express_headers, tracked_connections, query
+):
+    response = express_client.get(DETAIL_URL + "?" + query, headers=express_headers)
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+@pytest.mark.parametrize("player_id", ["missing", "Aaronha01", "aaron"])
+def test_missing_detail_is_a_redacted_correlated_404(
+    express_client, express_headers, player_id, caplog
+):
+    response = express_client.get(
+        PLAYERS_URL + "/" + player_id,
+        headers={**express_headers, "X-Request-ID": "missing-detail-1"},
+    )
+
+    assert_error(response, 404, "player_not_found")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["operation"] == "express_integration.get_player"
+    assert event["route"] == DETAIL_ROUTE
+    assert event["status"] == 404
+    assert event["request_id"] == "missing-detail-1"
+    assert event["error_code"] == "player_not_found"
+    assert event["exception_type"] == "PlayersNotFoundError"
+    assert event["result_count"] == 0
+    assert caplog.records[-1].exc_info is None
+    assert player_id not in response.get_json()["error"]["message"]
+    assert PLAYERS_URL + "/" + player_id not in caplog.text
+
+
+def test_duplicate_stored_id_is_a_storage_error_not_an_arbitrary_detail(
+    express_client, express_headers, player_db, caplog
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            "INSERT INTO players SELECT * FROM players WHERE playerId = ?", ("aaronha01",)
+        )
+        conn.commit()
+
+    response = express_client.get(DETAIL_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    assert "aaronha01" not in caplog.text
+    assert "aaronha01" not in response.get_data(as_text=True)
 
 
 @pytest.mark.parametrize(
@@ -280,11 +420,12 @@ def test_invalid_inputs_fail_before_any_database_read(
         (MAX_QUERY_STRING_BYTES + 1, 414, "request_too_large"),
     ],
 )
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_exact_query_string_size_boundary(
-    express_client, express_headers, tracked_connections, size, status, code
+    express_client, express_headers, tracked_connections, size, status, code, url
 ):
     response = express_client.get(
-        PLAYERS_URL + "?q=" + "x" * (size - 2), headers=express_headers
+        url + "?q=" + "x" * (size - 2), headers=express_headers
     )
     assert_error(response, status, code)
     assert tracked_connections == []
@@ -301,8 +442,9 @@ def test_request_size_is_checked_after_authentication(
 
 
 @pytest.mark.parametrize("input_terminated", [False, True])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_request_bodies_are_rejected_without_reading_them(
-    express_client, express_headers, tracked_connections, input_terminated
+    express_client, express_headers, tracked_connections, input_terminated, url
 ):
     class UnreadableBody(io.BytesIO):
         def read(self, *args, **kwargs):
@@ -312,7 +454,7 @@ def test_request_bodies_are_rejected_without_reading_them(
             pytest.fail("A GET body must not be read")
 
     response = express_client.get(
-        PLAYERS_URL,
+        url,
         headers=express_headers,
         environ_overrides={
             "CONTENT_LENGTH": "1",
@@ -325,11 +467,12 @@ def test_request_bodies_are_rejected_without_reading_them(
 
 
 @pytest.mark.parametrize("input_terminated", [False, True])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_transfer_encoded_bodies_are_rejected(
-    express_client, express_headers, tracked_connections, input_terminated
+    express_client, express_headers, tracked_connections, input_terminated, url
 ):
     response = express_client.get(
-        PLAYERS_URL,
+        url,
         headers=express_headers,
         environ_overrides={
             "HTTP_TRANSFER_ENCODING": "chunked",
@@ -390,9 +533,13 @@ def test_unsafe_request_ids_are_replaced(
     [
         (API_PREFIX, "GET", 404, "not_found"),
         (API_PREFIX + "/unknown", "GET", 404, "not_found"),
-        (PLAYERS_URL + "/aaronha01", "GET", 404, "not_found"),
+        (DETAIL_URL + "/extra", "GET", 404, "not_found"),
+        (DETAIL_URL + "/", "GET", 404, "not_found"),
+        (PLAYERS_URL + "/a%2Fb", "GET", 404, "not_found"),
         (PLAYERS_URL, "POST", 405, "method_not_allowed"),
         (PLAYERS_URL, "DELETE", 405, "method_not_allowed"),
+        (DETAIL_URL, "POST", 405, "method_not_allowed"),
+        (DETAIL_URL, "DELETE", 405, "method_not_allowed"),
     ],
 )
 def test_routing_errors_are_correlated_and_do_not_query(
@@ -405,18 +552,19 @@ def test_routing_errors_are_correlated_and_do_not_query(
     assert tracked_connections == []
 
 
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_head_and_options_require_authentication(
-    express_client, express_headers, tracked_connections
+    express_client, express_headers, tracked_connections, url
 ):
-    assert express_client.head(PLAYERS_URL).status_code == 401
-    assert express_client.options(PLAYERS_URL).status_code == 401
+    assert express_client.head(url).status_code == 401
+    assert express_client.options(url).status_code == 401
     assert tracked_connections == []
 
-    options = express_client.options(PLAYERS_URL, headers=express_headers)
+    options = express_client.options(url, headers=express_headers)
     assert options.status_code == 200
     assert "X-Request-ID" in options.headers
     assert tracked_connections == []
-    head = express_client.head(PLAYERS_URL, headers=express_headers)
+    head = express_client.head(url, headers=express_headers)
     assert head.status_code == 200
     assert head.data == b""
     assert "X-Request-ID" in head.headers
@@ -432,8 +580,9 @@ def test_head_and_options_require_authentication(
         ),
     ],
 )
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_http_reads_use_configured_deadlines(
-    express_app, express_headers, monkeypatch, overrides, expected
+    express_app, express_headers, monkeypatch, overrides, expected, url
 ):
     import app
 
@@ -447,12 +596,19 @@ def test_http_reads_use_configured_deadlines(
     for name, value in overrides.items():
         monkeypatch.setenv(name, value)
     with app.create_app().test_client() as client:
-        response = client.get(PLAYERS_URL, headers=express_headers)
+        response = client.get(url, headers=express_headers)
     assert response.status_code == 200
     assert calls == [expected]
 
 
-@pytest.mark.parametrize("stage", ["constructor", "search"])
+@pytest.mark.parametrize("stage", ["constructor", "read"])
+@pytest.mark.parametrize(
+    ("path", "operation", "query", "route"),
+    [
+        (PLAYERS_URL, "search_players", {"q": "sensitive-search"}, PLAYERS_URL),
+        (PLAYERS_URL + "/sensitiveplayer", "get_player", None, DETAIL_ROUTE),
+    ],
+)
 @pytest.mark.parametrize(
     ("exception", "status", "code"),
     [
@@ -463,7 +619,7 @@ def test_http_reads_use_configured_deadlines(
 )
 def test_safe_error_mapping_and_redacted_failure_logs(
     express_client, express_headers, express_token, monkeypatch, caplog,
-    stage, exception, status, code
+    stage, exception, status, code, path, operation, query, route
 ):
     def fail(*args, **kwargs):
         raise exception
@@ -471,11 +627,11 @@ def test_safe_error_mapping_and_redacted_failure_logs(
     if stage == "constructor":
         monkeypatch.setattr(express_api, "PlayerService", fail)
     else:
-        monkeypatch.setattr(PlayerService, "search_players", fail)
+        monkeypatch.setattr(PlayerService, operation, fail)
     response = express_client.get(
-        PLAYERS_URL,
+        path,
         headers={**express_headers, "X-Request-ID": "failure-123"},
-        query_string={"q": "sensitive-search"},
+        query_string=query,
     )
     assert_error(response, status, code)
     event = json.loads(caplog.records[-1].getMessage())
@@ -484,37 +640,42 @@ def test_safe_error_mapping_and_redacted_failure_logs(
     assert event["error_code"] == code
     assert event["exception_type"] == type(exception).__name__
     assert event["result_count"] == 0
-    assert event["route"] == PLAYERS_URL
+    assert event["route"] == route
     assert caplog.records[-1].exc_info is None
-    for sensitive in (express_token, "sensitive-search", "private", "Authorization"):
+    for sensitive in (
+        express_token, "sensitive-search", "sensitiveplayer", "private", "Authorization"
+    ):
         assert sensitive not in caplog.text
         assert sensitive not in response.get_data(as_text=True)
 
 
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_missing_storage_returns_503_without_recreating_it(
-    express_client, express_headers, player_db
+    express_client, express_headers, player_db, url
 ):
     player_db.unlink()
-    response = express_client.get(PLAYERS_URL, headers=express_headers)
+    response = express_client.get(url, headers=express_headers)
     assert_error(response, 503, "storage_unavailable")
     assert not player_db.exists()
 
 
 @pytest.mark.parametrize("invalid", [float("inf"), -float("inf"), b"not-json"])
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_invalid_stored_json_never_becomes_a_successful_response(
-    express_client, express_headers, player_db, invalid
+    express_client, express_headers, player_db, invalid, url
 ):
     with closing(sqlite3.connect(player_db)) as conn:
         conn.execute("UPDATE players SET height = ? WHERE playerId = ?", (invalid, "aaronha01"))
         conn.commit()
-    response = express_client.get(PLAYERS_URL, headers=express_headers)
+    response = express_client.get(url, headers=express_headers)
     assert_error(response, 503, "storage_unavailable")
     assert "Infinity" not in response.get_data(as_text=True)
     assert "not-json" not in response.get_data(as_text=True)
 
 
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_real_lock_exhaustion_is_503_and_releases_connections(
-    express_app, express_headers, player_db, monkeypatch
+    express_app, express_headers, player_db, monkeypatch, url
 ):
     import app
 
@@ -523,52 +684,64 @@ def test_real_lock_exhaustion_is_503_and_releases_connections(
     with app.create_app().test_client() as client:
         with closing(sqlite3.connect(player_db)) as writer:
             writer.execute("BEGIN EXCLUSIVE")
-            response = client.get(PLAYERS_URL, headers=express_headers)
+            response = client.get(url, headers=express_headers)
             assert_error(response, 503, "storage_unavailable")
             writer.rollback()
-        assert client.get(PLAYERS_URL, headers=express_headers).status_code == 200
+        assert client.get(url, headers=express_headers).status_code == 200
 
 
+@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL])
 def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
-    express_app, express_headers, monkeypatch
+    express_app, express_headers, monkeypatch, url
 ):
     import app
 
     connect = sqlite3.connect
 
-    class ExpensiveCountConnection(sqlite3.Connection):
+    class ExpensiveReadConnection(sqlite3.Connection):
         def execute(self, query, parameters=()):
-            if query == "SELECT COUNT(*) FROM players":
+            if query in (
+                "SELECT COUNT(*) FROM players",
+                "SELECT * FROM players WHERE playerId COLLATE BINARY = ? LIMIT ?",
+            ):
                 query = (
                     "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL "
                     "SELECT i + 1 FROM n WHERE i < 10000000) SELECT SUM(i) FROM n"
                 )
+                parameters = ()
             return super().execute(query, parameters)
 
     def expensive_connect(*args, **kwargs):
-        return connect(*args, factory=ExpensiveCountConnection, **kwargs)
+        return connect(*args, factory=ExpensiveReadConnection, **kwargs)
 
     monkeypatch.setenv("PLAYER_QUERY_TIMEOUT_SECONDS", "0.05")
     monkeypatch.setattr(sqlite3, "connect", expensive_connect)
     with app.create_app().test_client() as client:
-        response = client.get(PLAYERS_URL, headers=express_headers)
+        response = client.get(url, headers=express_headers)
         assert_error(response, 504, "query_timeout")
         monkeypatch.setattr(sqlite3, "connect", connect)
-        assert client.get(PLAYERS_URL, headers=express_headers).status_code == 200
+        assert client.get(url, headers=express_headers).status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("path", "query", "operation", "route"),
+    [
+        (PLAYERS_URL, {"q": "Hank"}, "search_players", PLAYERS_URL),
+        (DETAIL_URL, None, "get_player", DETAIL_ROUTE),
+    ],
+)
 def test_success_logs_are_structured_without_player_or_query_data(
-    express_client, express_headers, express_token, caplog
+    express_client, express_headers, express_token, caplog, path, query, operation, route
 ):
     caplog.set_level(logging.INFO)
     response = express_client.get(
-        PLAYERS_URL, query_string={"q": "Hank"}, headers=express_headers
+        path, query_string=query, headers=express_headers
     )
     assert response.status_code == 200
     event = json.loads(caplog.records[-1].getMessage())
     assert event["event"] == "express_request"
-    assert event["operation"] == "express_integration.search_players"
-    assert event["route"] == PLAYERS_URL
+    assert event["operation"] == "express_integration." + operation
+    assert event["route"] == route
     assert event["status"] == 200
     assert event["result_count"] == 1
     assert event["error_code"] is None
@@ -623,17 +796,48 @@ def test_complete_seed_pagination_through_authenticated_http(
     assert len(set(received_ids)) == 19370
 
 
+def test_seed_details_match_independent_csv_records(
+    express_client, express_headers, seed_player_records
+):
+    assert len(seed_player_records) == 19370
+    selected = [
+        seed_player_records[0],
+        seed_player_records[len(seed_player_records) // 2],
+        seed_player_records[-1],
+    ]
+    for field in ("birthYear", "height", "weight"):
+        selected.append(next(row for row in seed_player_records if row[field] is None))
+    numeric_columns = (
+        "birthYear", "birthMonth", "birthDay", "deathYear", "deathMonth", "deathDay",
+        "height", "weight",
+    )
+    for row in selected:
+        expected = {
+            column: (
+                float(value) if column in numeric_columns and value is not None else value
+            )
+            for column, value in row.items()
+        }
+        response = express_client.get(
+            PLAYERS_URL + "/" + row["playerId"], headers=express_headers
+        )
+        assert response.status_code == 200
+        assert response.get_json()["data"] == expected
+
+
 def test_legacy_player_routes_stay_unauthenticated_and_unchanged(
     express_client, player_records
 ):
     listing = express_client.get("/v1/players")
     detail = express_client.get("/v1/players/aaronha01")
+    quoted_detail = express_client.get("/v1/players/quote%2701")
     absent = express_client.get("/v1/players/missing")
     assert listing.get_json() == player_records
     assert detail.get_json() == player_records[0]
+    assert quoted_detail.get_json() == player_records[2]
     assert absent.status_code == 200
     assert absent.get_json() == {"error": "No record found with player_id=missing"}
-    for response in (listing, detail, absent):
+    for response in (listing, detail, quoted_detail, absent):
         assert "X-Request-ID" not in response.headers
         assert "Cache-Control" not in response.headers
 

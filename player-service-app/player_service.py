@@ -29,6 +29,18 @@ def validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
 
 
+def validate_player_id(player_id: str) -> None:
+    if (
+        not isinstance(player_id, str)
+        or not 1 <= len(player_id) <= MAX_PLAYER_ID_LENGTH
+        or not player_id.isascii()
+        or not player_id.isalnum()
+    ):
+        raise ValueError(
+            f"player IDs must be 1-{MAX_PLAYER_ID_LENGTH} ASCII alphanumeric characters"
+        )
+
+
 def validate_db_timeout(name: str, value: float, minimum: float) -> None:
     if type(value) not in (int, float) or not minimum <= value <= MAX_DB_TIMEOUT_SECONDS:
         raise ValueError(
@@ -231,6 +243,18 @@ class PlayerService:
         clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         return clause, tuple(parameters)
 
+    def get_player(self, player_id: str) -> dict:
+        validate_player_id(player_id)
+        rows = self._fetchall(
+            "SELECT * FROM players WHERE playerId COLLATE BINARY = ? LIMIT ?",
+            (player_id, 2),
+        )
+        if len(rows) > 1:
+            raise sqlite3.DataError("Player details require unique stored player IDs")
+        if not rows:
+            raise PlayersNotFoundError((player_id,))
+        return self.convert_row_to_dict(rows[0])
+
     def search_players(
         self,
         filters: Optional[PlayerFilters] = None,
@@ -398,16 +422,7 @@ class PlayerService:
             )
         player_ids = tuple(player_ids)
         for player_id in player_ids:
-            if (
-                not isinstance(player_id, str)
-                or not 1 <= len(player_id) <= MAX_PLAYER_ID_LENGTH
-                or not player_id.isascii()
-                or not player_id.isalnum()
-            ):
-                raise ValueError(
-                    f"player IDs must be 1-{MAX_PLAYER_ID_LENGTH} "
-                    "ASCII alphanumeric characters"
-                )
+            validate_player_id(player_id)
         if len(set(player_ids)) != len(player_ids):
             raise ValueError("player_ids must contain distinct IDs")
 

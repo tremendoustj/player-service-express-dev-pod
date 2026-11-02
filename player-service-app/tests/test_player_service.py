@@ -79,6 +79,9 @@ def test_all_reads_close_connections(player_db, tracked_connections):
     service.get_all_players()
     service.search_by_player("aaronha01")
     service.search_by_player("missing")
+    service.get_player("aaronha01")
+    with pytest.raises(PlayersNotFoundError):
+        service.get_player("missing")
     service.search_by_country("USA")
     service.search_by_country("missing")
     service.search_players()
@@ -100,6 +103,7 @@ def test_all_reads_close_connections(player_db, tracked_connections):
     [
         ("get_all_players", ()),
         ("search_by_player", ("aaronha01",)),
+        ("get_player", ("aaronha01",)),
         ("search_by_country", ("USA",)),
         ("search_players", ()),
         ("rank_players", ("height",)),

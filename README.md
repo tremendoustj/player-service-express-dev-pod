@@ -18,9 +18,12 @@ explicit missing-value exclusions. Ordered comparisons support 2-5 distinct IDs,
 null-aware numeric differences, and explicit missing-player errors.
 Shared reads can opt into validated SQLite deadlines and bounded lock waits;
 cancellation closes connections without changing legacy timeout defaults.
-An [opt-in authenticated search/filter API](docs/express-api.md) now exposes
-`GET /integrations/express/v1/players` with strict validation, bounded reads,
-correlation IDs, sanitized errors, and structured request log messages.
+An [opt-in authenticated read API](docs/express-api.md) now exposes search/filter
+at `GET /integrations/express/v1/players` and exact-ID details at
+`GET /integrations/express/v1/players/{player_id}`, with strict validation, bounded
+reads, correlation IDs, sanitized errors, and structured request log messages.
+Details return one full record, a 404 for an absent ID, or a storage error for
+duplicate stored IDs; legacy detail behavior is unchanged.
 It is disabled by default; see the linked configuration and local-only setup.
 The remaining integration endpoints, OpenAPI contract, metrics, packaging, and
 Express/Nexla validation are still pending. Legacy API response formats are
