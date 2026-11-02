@@ -95,6 +95,8 @@ def test_all_reads_close_connections(player_db, tracked_connections):
     service.search_by_player("missing")
     service.search_by_country("USA")
     service.search_by_country("missing")
+    service.search_players()
+    service.search_players(offset=100000)
     service.get_columns()
 
     assert_connections_closed(tracked_connections)
@@ -106,6 +108,7 @@ def test_all_reads_close_connections(player_db, tracked_connections):
         ("get_all_players", ()),
         ("search_by_player", ("aaronha01",)),
         ("search_by_country", ("USA",)),
+        ("search_players", ()),
     ],
 )
 def test_failed_queries_raise_and_close_connections(
@@ -118,6 +121,27 @@ def test_failed_queries_raise_and_close_connections(
 
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         getattr(service, method)(*args)
+
+    assert_connections_closed(tracked_connections)
+
+
+def test_failed_search_page_closes_transaction(player_db, tracked_connections, monkeypatch):
+    service = PlayerService(player_db)
+    connect = sqlite3.connect
+
+    class FailingPageConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql.startswith("SELECT * FROM players"):
+                raise sqlite3.OperationalError("simulated page failure")
+            return super().execute(sql, parameters)
+
+    def fail_page(*args, **kwargs):
+        return connect(*args, factory=FailingPageConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", fail_page)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated page failure"):
+        service.search_players()
 
     assert_connections_closed(tracked_connections)
 

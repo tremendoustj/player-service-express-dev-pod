@@ -9,8 +9,10 @@ evaluates REST and MCP integration with Express.dev/Nexla, defines the proposed
 read-only player tools, and records the test baseline and external validation
 requirements. Shared SQLite reads are now parameterized, read-only, and explicitly
 closed, with isolated regression coverage and deterministic missing-player handling.
-Express-facing endpoints are not implemented yet; existing successful API response
-formats are unchanged.
+The shared service also supports validated name/ID search, country/year/handedness
+filters, and bounded, deterministic pagination with snapshot-consistent totals.
+Express-facing endpoints and analytics are not implemented yet; existing API
+response formats are unchanged.
 
 ## Dependencies
 

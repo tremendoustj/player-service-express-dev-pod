@@ -2,13 +2,14 @@
 
 Assessment date: 2026-11-02.
 
-**Status: shared data-access prerequisite implemented; Express integration pending.**
-Player/country lookups are parameterized, reads explicitly close their read-only
-SQLite connections, and missing-player handling has regression coverage. No
-integration endpoints, authentication, observability, or MCP server are implemented
-yet. No infrastructure was deployed and no Nexla resources were created. This
-document distinguishes the existing application, verified platform capabilities,
-and proposed changes.
+**Status: shared data access and bounded search/filter primitives implemented;
+Express API pending.** Player/country lookups are parameterized, reads explicitly
+close their read-only SQLite connections, and missing-player handling has
+regression coverage. Internal search supports validated filters and deterministic
+pagination. No integration endpoints, authentication, observability, or MCP server
+are implemented yet. No infrastructure was deployed and no Nexla resources were
+created. This document distinguishes the existing application, verified platform
+capabilities, and proposed changes.
 
 ## 1. Repository assessment
 
@@ -140,7 +141,7 @@ allowing the unchanged legacy route to return its intended
 future integration API's proposed 404 contract. Storage failures still raise;
 they are not converted into empty successful results.
 
-The local suite now has **29 passing tests** covering exact legacy responses,
+At the end of increment 2, the local suite had **29 passing tests** covering exact legacy responses,
 all 24 fields, nullable records, quote-containing/Unicode values, SQL-shaped
 inputs, empty/missing results, read-only enforcement, missing/corrupt storage,
 URI-sensitive filesystem names, and connection cleanup on success and failure.
@@ -154,8 +155,75 @@ source player-service-app/.venv/bin/activate
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
 
-Bounded query operations, integration authentication/validation, configurable
+### Bounded search and filtering (increment 3)
+
+`PlayerService.search_players()` is an internal Python service method, **not a new
+HTTP route or published tool**. It uses the immutable, validated `PlayerFilters`
+value object and a shared parameterized filter builder intended for later
+statistics and ranking operations. Existing legacy methods and routes retain
+their response formats and semantics.
+
+For an existing, initialized database:
+
+```python
+from player_service import PlayerFilters, PlayerService
+
+service = PlayerService("/absolute/path/to/player.db")
+page = service.search_players(
+    PlayerFilters(q="Aaron", birth_country="USA"),
+    limit=20,
+    offset=0,
+)
+```
+
+All filters are optional (`None` means no constraint) and are combined with AND:
+
+| Filter | Implemented service semantics |
+| --- | --- |
+| `q` | Literal substring across `playerId`, `nameFirst`, `nameLast`, `nameGiven`, or first name + space + last name. SQLite's default LIKE folds ASCII case only: `rené` matches `René`, but `RENÉ` does not. `%`, `_`, and backslash are literal characters, not caller-supplied wildcards. |
+| `birth_country` | Exact, case-sensitive match, including Unicode and apostrophes. |
+| `birth_year_min`, `birth_year_max` | Inclusive integer bounds, 1-9999; minimum must not exceed maximum. Null years do not satisfy a year constraint. |
+| `bats` | Exactly `L`, `R`, or `B`. |
+| `throws` | Exactly `L`, `R`, or the dataset's recorded `S`. |
+
+Text filters must contain 1-100 printable Unicode characters and cannot be
+whitespace-only. Text is not trimmed or otherwise normalized. Invalid values raise
+`ValueError`; numeric strings, floats, and booleans are not silently coerced to
+integers. The future HTTP layer must parse its string parameters explicitly.
+Search requires a `PlayerFilters` instance rather than an arbitrary dictionary.
+
+Results contain `data` (full stored records, including nulls) and `pagination`
+with `limit`, `offset`, `total`, and nullable `next_offset`. The default limit is
+20, accepted limits are 1-100, and offsets are 0-100000. Results are ordered by
+`playerId` using binary collation, independent of insertion order. The total
+counts the entire filtered population, including when a page is empty or beyond
+the end.
+
+Count and page queries share one explicitly started read transaction, so they
+observe the same snapshot even if a concurrent WAL writer commits between them.
+Connections close on both count and page failures; errors propagate instead of
+becoming empty successful results. Separate page requests still do not promise
+snapshot consistency across a later database refresh.
+
+`next_offset` advances by `limit` only when more results exist and the next offset
+is within the supported cap. It is also null when advancing would exceed 100000,
+even if `total` is larger. Full-scan clients must compare collected rows with
+`total` and narrow filters if the supported window is insufficient; a null next
+offset alone does not prove a complete scan of an arbitrarily large population.
+
+The complete local suite now has **128 passing tests**. Coverage includes literal
+search and case behavior, combined filters, nulls, switch handedness, strict
+validation, exact page/offset caps, ordering, concurrent snapshot consistency,
+and connection cleanup on failure. A temporary database seeded from `Player.csv`
+is traversed in 100-row pages and produces **all 19,370 unique IDs** in order,
+without duplicates or missing records. This is local SQLite validation, not a
+Nexla connector or Express chat test.
+
+Full-population statistics, rankings, and comparisons are the next query-layer
+increment. Integration authentication, HTTP validation/OpenAPI, execution
 deadlines, observability, and production packaging remain future increments.
+The current search limits bound inputs and result sizes, **not query duration**;
+do not expose this service directly as an unauthenticated integration.
 
 ## 2. Verified Express.dev / Nexla mechanisms
 
@@ -221,7 +289,8 @@ recommendation feedback, or Ollama chat as an integration tool.
 
 ## 4. Proposed application/tool contract
 
-Everything in this section is **to be implemented**, not an existing route.
+The HTTP contracts in this section are **to be implemented**, not existing routes.
+Internal search/filter semantics are implemented as described in increment 3.
 Use an opt-in blueprint under `/integrations/express/v1`. The proposed operation
 names are also the desired tool names; Studio's actual generated names and
 schemas must be inspected rather than assumed to match automatically.
@@ -247,8 +316,9 @@ Only fixed, allowlisted columns/operations may participate in queries.
   and integer page parameters. Reject unknown parameters, ambiguous duplicate
   scalar parameters, malformed values, and over-limit input; do not silently
   clamp or substitute defaults for invalid input.
-- Proposed page limits: default 20, maximum 100; offset 0-100000. Order search
-  pages by `playerId`; add `playerId` as the deterministic ranking tie-breaker.
+- Page limits already enforced by the internal search method: default 20,
+  maximum 100; offset 0-100000. Search pages are ordered by `playerId`; add
+  `playerId` as the deterministic ranking tie-breaker.
   Return `data` plus `pagination.limit`, `offset`, `total`, and nullable
   `next_offset`. Compute totals using the same filters, not from the page length.
 - Aggregates apply to the entire matching population, not just a page. Report
@@ -343,7 +413,8 @@ or document and validate a deliberate compatibility decision.
 | --- | --- |
 | Assessment (this document) | Repository/data inventory, official-source decision, and existing pytest baseline recorded. No runtime behavior changed. |
 | Safe shared data access (**complete**) | Parameterized player/country lookups, deterministic no-match behavior, read-only connections with explicit cleanup, and temporary-database tests. Existing list/detail response contracts retained; regression tests cover quote-containing input and intended legacy missing-ID error behavior. |
-| Bounded player query capabilities (**next increment**) | Fixture-backed tests for search/filter, full-population aggregates, nulls, switch handedness, stable rankings/ties, comparisons, and exact pagination boundaries. Shared query methods, not duplicated business logic. |
+| Bounded player search/filter (**complete**) | Validated shared filters, deterministic pages and snapshot-consistent totals, null/switch-handedness coverage, exact input/page boundaries, and a complete local 19,370-ID seed traversal. Legacy routes unchanged. |
+| Player analytics and comparisons (**next increment**) | Reuse the shared filters for full-population aggregates and rankings; fixture-backed tests for known/missing values, empty populations, stable rankings/ties, null exclusions, and bounded ordered comparisons. |
 | Authenticated integration API and schema | Opt-in routes, fail-closed configuration, strict validation, deadlines, safe errors, and OpenAPI contract tests. Flask test-client tests cover all operations, unauthorized calls, malformed inputs, unavailable/locked storage, and unchanged legacy/Ollama routes (Ollama mocked). |
 | Observability | Correlation IDs across success/failure, redacted structured logs, bounded metrics labels, and counter/latency tests. Include timeout/error paths, not just happy paths. |
 | Packaging and local integration | Production container and environment/runbook documentation; real loopback HTTP smoke tests, fresh/existing DB startup, disabled/misconfigured integration, and read-only mounts. Run the entire existing and new suite. Build/test only locally, stop all started processes. |
@@ -404,7 +475,7 @@ These are future, approval-gated actions, not actions completed by this assessme
 | Pagination / correlation | No tenant-level source pagination configuration or correlation propagation was exercised. | Demonstrate a complete bounded scan and observable request/receipt linkage using real calls. |
 | Data interpretation | Repository lacks authoritative dataset provenance, measurement-unit documentation, and refresh policy. | Confirm those facts or explicitly expose values as source-defined units and a historical snapshot; never claim current/performance statistics. |
 
-**End-to-end integration is not complete.** The baseline and increment-2 test
+**End-to-end integration is not complete.** The baseline and increment-2/3 test
 results above are local Flask/SQLite coverage, not an Express, Nexla, MCP, Docker,
 or live Ollama integration success. Implementation work remains in addition to
 the external items; documenting blockers does not make the implementation complete.
