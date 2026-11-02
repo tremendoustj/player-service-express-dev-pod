@@ -14,8 +14,10 @@ filters, and bounded, deterministic pagination with snapshot-consistent totals.
 Filtered population statistics include known/missing measurement counts and
 bounded categorical summaries from a consistent snapshot. Numeric rankings
 support height, weight, and birth year with stable ties, bounded pages, and
-explicit missing-value exclusions. Express-facing endpoints and comparisons
-are not implemented yet; existing API response formats are unchanged.
+explicit missing-value exclusions. Ordered comparisons support 2-5 distinct IDs,
+null-aware numeric differences, and explicit missing-player errors.
+Express-facing endpoints are not implemented yet; existing API response formats
+are unchanged.
 
 ## Dependencies
 

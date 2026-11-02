@@ -1,9 +1,10 @@
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
+from itertools import combinations
 from math import isfinite
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Union
 
 from app_paths import PLAYER_DB
 
@@ -14,6 +15,8 @@ MAX_PAGE_OFFSET = 100000
 MAX_FILTER_TEXT_LENGTH = 100
 DEFAULT_GROUP_LIMIT = 20
 MAX_GROUP_LIMIT = 100
+MAX_COMPARISON_PLAYERS = 5
+MAX_PLAYER_ID_LENGTH = 32
 
 
 def _validate_integer(name: str, value: int, minimum: int, maximum: int) -> None:
@@ -33,6 +36,12 @@ def _pagination(limit: int, offset: int, total: int) -> dict:
             else None
         ),
     }
+
+
+class PlayersNotFoundError(LookupError):
+    def __init__(self, missing_ids: tuple[str, ...]) -> None:
+        self.missing_ids = missing_ids
+        super().__init__("One or more requested player IDs were not found")
 
 
 @dataclass(frozen=True)
@@ -290,6 +299,83 @@ class PlayerService:
                 }
 
         return {"total": total, "numeric": numeric, "groups": groups}
+
+    def compare_players(self, player_ids: Union[list[str], tuple[str, ...]]) -> dict:
+        if not isinstance(player_ids, (list, tuple)):
+            raise TypeError("player_ids must be a list or tuple of player IDs")
+        if not 2 <= len(player_ids) <= MAX_COMPARISON_PLAYERS:
+            raise ValueError(
+                f"player_ids must contain between 2 and {MAX_COMPARISON_PLAYERS} IDs"
+            )
+        player_ids = tuple(player_ids)
+        for player_id in player_ids:
+            if (
+                not isinstance(player_id, str)
+                or not 1 <= len(player_id) <= MAX_PLAYER_ID_LENGTH
+                or not player_id.isascii()
+                or not player_id.isalnum()
+            ):
+                raise ValueError(
+                    f"player IDs must be 1-{MAX_PLAYER_ID_LENGTH} "
+                    "ASCII alphanumeric characters"
+                )
+        if len(set(player_ids)) != len(player_ids):
+            raise ValueError("player_ids must contain distinct IDs")
+
+        placeholders = ", ".join("?" for _ in player_ids)
+        # One extra row detects duplicate stored IDs without an unbounded fetch.
+        rows = self._fetchall(
+            f"SELECT * FROM players WHERE playerId COLLATE BINARY IN ({placeholders}) "
+            "LIMIT ?",
+            (*player_ids, len(player_ids) + 1),
+        )
+        records = {}
+        for row in rows:
+            record = self.convert_row_to_dict(row)
+            if record["playerId"] in records:
+                raise sqlite3.DataError("Comparisons require unique stored player IDs")
+            records[record["playerId"]] = record
+        missing_ids = tuple(
+            player_id for player_id in player_ids if player_id not in records
+        )
+        if missing_ids:
+            raise PlayersNotFoundError(missing_ids)
+        players = [records[player_id] for player_id in player_ids]
+
+        numeric_fields = ("birthYear", "height", "weight")
+        for player in players:
+            for field in numeric_fields:
+                value = player[field]
+                if value is not None and (
+                    not isinstance(value, (int, float)) or not isfinite(value)
+                ):
+                    raise sqlite3.DataError(
+                        f"{field} comparisons require finite numeric values"
+                    )
+
+        differences = []
+        for left, right in combinations(players, 2):
+            numeric = {}
+            for field in numeric_fields:
+                left_value, right_value = left[field], right[field]
+                difference = (
+                    left_value - right_value
+                    if left_value is not None and right_value is not None
+                    else None
+                )
+                if difference is not None and not isfinite(difference):
+                    raise sqlite3.DataError(
+                        f"{field} comparisons require finite numeric differences"
+                    )
+                numeric[field] = difference
+            differences.append(
+                {
+                    "left_player_id": left["playerId"],
+                    "right_player_id": right["playerId"],
+                    "numeric": numeric,
+                }
+            )
+        return {"data": players, "differences": differences}
 
     def get_all_players(self):
         result = self._fetchall("SELECT * FROM players")

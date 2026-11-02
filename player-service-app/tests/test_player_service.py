@@ -3,7 +3,7 @@ from contextlib import closing
 
 import pytest
 
-from player_service import PlayerService
+from player_service import PlayersNotFoundError, PlayerService
 
 
 @pytest.fixture
@@ -101,6 +101,9 @@ def test_all_reads_close_connections(player_db, tracked_connections):
     service.rank_players("birthYear", limit=1, offset=100000)
     service.get_player_statistics()
     service.get_player_statistics(group_limit=1)
+    service.compare_players(["aaronha01", "aaronto01"])
+    with pytest.raises(PlayersNotFoundError):
+        service.compare_players(["aaronha01", "missing"])
     service.get_columns()
 
     assert_connections_closed(tracked_connections)
@@ -115,6 +118,7 @@ def test_all_reads_close_connections(player_db, tracked_connections):
         ("search_players", ()),
         ("rank_players", ("height",)),
         ("get_player_statistics", ()),
+        ("compare_players", (["aaronha01", "aaronto01"],)),
     ],
 )
 def test_failed_queries_raise_and_close_connections(
@@ -187,6 +191,7 @@ def test_failed_statistics_group_closes_transaction(
     [
         ("get_player_statistics", (), "height statistics"),
         ("rank_players", ("height",), "height rankings"),
+        ("compare_players", (["aaronha01", "aaronto01"],), "height comparisons"),
     ],
 )
 def test_invalid_numeric_data_closes_transaction(
@@ -199,6 +204,32 @@ def test_invalid_numeric_data_closes_transaction(
 
     with pytest.raises(sqlite3.DataError, match=message):
         getattr(service, method)(*args)
+
+    assert_connections_closed(tracked_connections)
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "overflow"])
+def test_comparison_data_errors_close_connections(
+    player_db, tracked_connections, failure
+):
+    service = PlayerService(player_db)
+    with closing(sqlite3.connect(player_db)) as conn:
+        if failure == "duplicate":
+            conn.execute(
+                "INSERT INTO players SELECT * FROM players WHERE playerId = ?",
+                ("aaronha01",),
+            )
+            message = "unique stored player IDs"
+        else:
+            conn.executemany(
+                "UPDATE players SET height = ? WHERE playerId = ?",
+                [(1e308, "aaronha01"), (-1e308, "aaronto01")],
+            )
+            message = "finite numeric differences"
+        conn.commit()
+
+    with pytest.raises(sqlite3.DataError, match=message):
+        service.compare_players(["aaronha01", "aaronto01"])
 
     assert_connections_closed(tracked_connections)
 
