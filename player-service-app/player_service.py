@@ -43,6 +43,23 @@ def validate_player_id(player_id: str) -> None:
         )
 
 
+def validate_comparison_ids(
+    player_ids: Union[list[str], tuple[str, ...]],
+) -> tuple[str, ...]:
+    if not isinstance(player_ids, (list, tuple)):
+        raise TypeError("player_ids must be a list or tuple of player IDs")
+    if not 2 <= len(player_ids) <= MAX_COMPARISON_PLAYERS:
+        raise ValueError(
+            f"player_ids must contain between 2 and {MAX_COMPARISON_PLAYERS} IDs"
+        )
+    player_ids = tuple(player_ids)
+    for player_id in player_ids:
+        validate_player_id(player_id)
+    if len(set(player_ids)) != len(player_ids):
+        raise ValueError("player_ids must contain distinct IDs")
+    return player_ids
+
+
 def validate_ranking(metric: str, direction: str) -> None:
     if not isinstance(metric, str) or metric not in _RANKING_COLUMNS:
         raise ValueError("metric must be one of height, weight, birthYear")
@@ -418,17 +435,7 @@ class PlayerService:
         return {"total": total, "numeric": numeric, "groups": groups}
 
     def compare_players(self, player_ids: Union[list[str], tuple[str, ...]]) -> dict:
-        if not isinstance(player_ids, (list, tuple)):
-            raise TypeError("player_ids must be a list or tuple of player IDs")
-        if not 2 <= len(player_ids) <= MAX_COMPARISON_PLAYERS:
-            raise ValueError(
-                f"player_ids must contain between 2 and {MAX_COMPARISON_PLAYERS} IDs"
-            )
-        player_ids = tuple(player_ids)
-        for player_id in player_ids:
-            validate_player_id(player_id)
-        if len(set(player_ids)) != len(player_ids):
-            raise ValueError("player_ids must contain distinct IDs")
+        player_ids = validate_comparison_ids(player_ids)
 
         placeholders = ", ".join("?" for _ in player_ids)
         # One extra row detects duplicate stored IDs without an unbounded fetch.

@@ -1,9 +1,8 @@
 # Express integration API: authenticated reads and analytics
 
-**Status: opt-in search/filter, player-detail, population-statistics, and numeric
-ranking endpoints are implemented and locally tested.** Comparisons and the
-OpenAPI contract are not yet exposed through this API. The comparison service
-method already exists.
+**Status: all five opt-in read operations (search/filter, player details,
+population statistics, numeric rankings, and comparisons) are implemented and
+locally tested.** The OpenAPI contract is not yet implemented.
 Metrics, production packaging, real loopback HTTP smoke tests, and authenticated
 Express/Nexla validation remain pending.
 
@@ -320,6 +319,69 @@ including attributes other than the selected metric, also produce 503, never
 partial rows or successful nonstandard JSON. Deadline cancellation produces
 504 `query_timeout`; connections close on success and failure.
 
+## Player comparisons
+
+`GET /integrations/express/v1/comparisons` compares an ordered selection of
+players, for example
+`/integrations/express/v1/comparisons?player_ids=aaronto01,aaronha01`.
+It uses the same bearer authentication, query-size/body restrictions, SQLite
+deadlines, strict JSON serialization, correlation headers, and no-store policy
+as the other operations.
+
+The only accepted query parameter is **`player_ids`**, required exactly once.
+Its value is a **comma-separated list of 2-5 distinct IDs**. Each ID must be
+1-32 ASCII alphanumeric characters and is matched exactly, case-sensitively
+using binary collation. Input order is retained; IDs are not trimmed,
+case-normalized, sorted, or deduplicated.
+
+Percent-encoded names, valid ASCII ID characters, and commas (`%2C`) are
+accepted. Decoding happens once, before splitting and validating the list.
+Repeated query keys are **not** an alternative list encoding; JSON arrays,
+empty list elements, spaces around commas, alternate separators, malformed
+UTF-8/percent escapes, duplicate IDs, and out-of-range cardinality return 400.
+Search filters, ranking/grouping parameters, pagination, and all other query
+parameters are rejected. Validation uses the same ID/cardinality/uniqueness
+helper as the service and happens **before any database access**, including
+schema inspection.
+
+A successful response contains exactly:
+
+| Response field | Contents |
+| --- | --- |
+| `data` | 2-5 full stored records in the requested order, retaining the same 24 field names, types, and nullable values as search. |
+| `differences` | Every unordered pair in input-position order. Each object contains `left_player_id`, `right_player_id`, and `numeric`. |
+| `request_id` | The same correlation identifier as the `X-Request-ID` response header. |
+
+Each `numeric` object contains `birthYear`, `height`, and `weight`, calculated
+as **left value minus right value**. For `[a, b, c]`, the pairs are `(a, b)`,
+`(a, c)`, then `(b, c)`. Reversing two input IDs reverses their difference's sign.
+A difference is null if either source value is null, including when both are
+unknown; zero and fractional values remain numeric. These are source attributes,
+not age calculations, performance statistics, player-quality judgments, or
+claims about measurement units or freshness.
+
+There is **no pagination**: at most five records and ten pairwise differences
+are returned. Any absent, well-formed ID produces a sanitized 404
+`player_not_found`, including an entirely empty database. There are no partial
+comparisons, empty successful missing-player results, or echoed missing IDs.
+HEAD performs the same validated read without a response body; authenticated
+automatic OPTIONS performs no database read.
+
+`PlayerService.compare_players()` performs one parameterized, read-only SELECT
+for all selected records, not separate detail calls. Records and differences
+therefore describe one SQLite snapshot. Retrieval is bounded to the requested
+ID count plus one (at most six rows) to detect duplicate selected stored IDs.
+Those duplicates return 503 `storage_unavailable`, never an arbitrary record.
+
+All three compared numeric attributes are checked for every selected player,
+even when another player's value is null. Invalid or infinite numeric storage,
+overflowing differences from finite operands, and nonfinite/unserializable
+returned fields produce 503, never partial or nonstandard JSON. Invalid records
+or duplicate IDs outside the selection do not block valid comparisons.
+The read uses the configured operation deadline; schema inspection has its own
+budget, and neither is a hard total HTTP timeout. Cancellation produces 504
+`query_timeout`; connections close on success and failure.
+
 ## Errors and correlation
 
 All integration JSON errors use this envelope:
@@ -338,11 +400,11 @@ All integration JSON errors use this envelope:
 | --- | --- | --- |
 | 400 | `invalid_request` | Invalid, ambiguous, or unsupported input, including a GET/HEAD body. |
 | 401 | `unauthorized` | Missing, malformed, or incorrect application credential. |
-| 404 | `not_found` | No implemented route at this URL; `/comparisons` remains unavailable. |
-| 404 | `player_not_found` | The well-formed requested player ID does not exist. |
+| 404 | `not_found` | No implemented route at this URL. |
+| 404 | `player_not_found` | One or more well-formed requested player IDs do not exist. |
 | 405 | `method_not_allowed` | Unsupported method; the response preserves the `Allow` header. |
 | 414 | `request_too_large` | Encoded query string exceeds 4096 bytes. |
-| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values, invalid/overflowing numeric aggregates, invalid stored ranking metrics, or duplicate selected detail IDs. |
+| 503 | `storage_unavailable` | Missing, locked, corrupt, or unusable storage, including invalid stored JSON values, invalid/overflowing numeric analytics, or duplicate selected detail/comparison IDs. |
 | 504 | `query_timeout` | Database read deadline exceeded. |
 | 500 | `internal_error` | Unexpected failure, with sanitized diagnostics in the request log. |
 
@@ -366,6 +428,8 @@ population** as `result_count`, not the number of returned categories; failures
 report zero, including failures after some aggregates have been computed.
 Rankings log the number of **returned page rows**, not the rankable total or
 excluded count, and report zero on failure.
+Comparisons log the number of **returned players**, not pairwise differences,
+and report zero on failure, including missing IDs and serialization failures.
 Tokens, request/query/body contents,
 player records, SQL, and exception messages/tracebacks are excluded. Successes
 use INFO and failures use WARNING
@@ -392,6 +456,10 @@ search response-extraction path for this operation: preserve `total`, `numeric`,
 Rankings do have rows at `$.data`, but their generated tools must also preserve
 `metric`, `direction`, `excluded_count`, pagination, and correlation metadata.
 Dropping that metadata can hide excluded players or an incomplete traversal.
+Comparison bindings must encode ordered IDs as one comma-separated `player_ids`
+value, not repeated parameters, and retain both `data` and `differences` with
+correlation metadata. Extracting only `$.data` discards the calculated comparison.
+Do not apply search pagination to comparisons or reorder their input/output.
 
 This is a supported header-credential mechanism, not evidence that MCP Studio
 has discovered or bound the endpoint. There is no documented arbitrary Express
@@ -407,7 +475,7 @@ source player-service-app/.venv/bin/activate
 python -m pytest -c player-service-app/pytest.ini player-service-app/tests -q
 ```
 
-The complete local suite passes **1155 tests**. Coverage includes disabled/invalid
+The complete local suite passes **1324 tests**. Coverage includes disabled/invalid
 startup, token isolation/rotation behavior,
 strict HTTP parsing, exact size/page bounds, auth before database access,
 correlated/redacted errors, real SQLite lock/deadline failures, cleanup,
@@ -426,5 +494,11 @@ empty/all-null populations, off-page invalid metrics, and page/serialization
 failures. Complete HTTP pagination in all six metric/direction combinations
 matches independent CSV-derived records across the **19,370-player** population:
 18,615 rankable heights, 18,533 weights, and 19,244 birth years.
+Comparison coverage verifies exact 2-5-ID/length/case bounds, input/pair order,
+single-value list encoding, strict parsing before schema reads, null/zero/fractional
+differences, explicit missing/duplicate errors, bounded retrieval, invalid numeric
+storage and subtraction overflow, serialization/query failures, and redacted logs.
+Five-player HTTP comparisons match independently converted seed records and all
+ten pairwise differences, including missing birth years, heights, and weights.
 Flask test-client coverage is not
 a real network, container, live Ollama, or Express/Nexla end-to-end result.

@@ -25,6 +25,7 @@ from player_service import (
     PlayerQueryTimeoutError,
     PlayersNotFoundError,
     PlayerService,
+    validate_comparison_ids,
     validate_db_timeout,
     validate_integer,
     validate_player_id,
@@ -52,6 +53,7 @@ _FILTER_PARAMETERS = frozenset(
 _SEARCH_PARAMETERS = _FILTER_PARAMETERS | {"limit", "offset"}
 _STATISTICS_PARAMETERS = _FILTER_PARAMETERS | {"group_limit"}
 _RANKING_PARAMETERS = _SEARCH_PARAMETERS | {"metric", "direction"}
+_COMPARISON_PARAMETERS = frozenset(("player_ids",))
 
 
 @dataclass(frozen=True)
@@ -280,6 +282,18 @@ def configure_express_api(app: Flask) -> None:
         result = player_service().rank_players(
             metric, filters, direction=direction, limit=limit, offset=offset
         )
+        return success_response(result, result_count=len(result["data"]))
+
+    @api.get("/comparisons")
+    def compare_players():
+        try:
+            arguments = _query_arguments(_COMPARISON_PARAMETERS)
+            player_ids = validate_comparison_ids(
+                arguments.get("player_ids", "").split(",")
+            )
+        except ValueError as exc:
+            return _error(400, "invalid_request", str(exc))
+        result = player_service().compare_players(player_ids)
         return success_response(result, result_count=len(result["data"]))
 
     @api.errorhandler(PlayersNotFoundError)

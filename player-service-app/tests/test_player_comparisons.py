@@ -375,7 +375,7 @@ def test_all_players_and_differences_share_one_query_snapshot(
 
 
 def test_repository_seed_comparisons_match_independent_records_and_differences(
-    service, seed_player_records
+    service, seed_player_records, expected_comparisons
 ):
     assert len(seed_player_records) == 19370
     assert all(
@@ -394,46 +394,9 @@ def test_repository_seed_comparisons_match_independent_records_and_differences(
                 and row["playerId"] not in {record["playerId"] for record in selected}
             )
         )
-    numeric_columns = (
-        "birthYear",
-        "birthMonth",
-        "birthDay",
-        "deathYear",
-        "deathMonth",
-        "deathDay",
-        "height",
-        "weight",
-    )
-    expected_records = [
-        {
-            column: (
-                float(value) if column in numeric_columns and value is not None else value
-            )
-            for column, value in row.items()
-        }
-        for row in selected
-    ]
-    expected_differences = []
-    for left_index, left in enumerate(selected):
-        for right in selected[left_index + 1 :]:
-            expected_differences.append(
-                {
-                    "left_player_id": left["playerId"],
-                    "right_player_id": right["playerId"],
-                    "numeric": {
-                        field: (
-                            None
-                            if left[field] is None or right[field] is None
-                            else float(left[field]) - float(right[field])
-                        )
-                        for field in ("birthYear", "height", "weight")
-                    },
-                }
-            )
-
     result = service.compare_players([row["playerId"] for row in selected])
 
-    assert result == {"data": expected_records, "differences": expected_differences}
+    assert result == expected_comparisons(selected)
     assert len(result["data"]) == 5
     assert len(result["differences"]) == 10
     json.dumps(result, allow_nan=False)

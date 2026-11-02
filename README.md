@@ -31,10 +31,12 @@ or performance-statistics claims.
 `GET /integrations/express/v1/rankings` exposes numeric rankings with a required
 `metric` (`height`, `weight`, or `birthYear`), shared filters, bounded pagination,
 and explicit null exclusions. Both sort directions retain ascending ID tie-breaks.
-It is disabled by default; see the linked configuration and local-only setup.
-The comparison HTTP endpoint, the OpenAPI contract, metrics, packaging, and
-Express/Nexla validation are still pending. Legacy API response formats are
-unchanged.
+`GET /integrations/express/v1/comparisons` accepts one comma-separated `player_ids`
+parameter containing 2-5 distinct IDs. It returns ordered full records and all
+pairwise, null-aware numeric differences, or a 404 if any player is missing.
+The integration is disabled by default; see the linked configuration and
+local-only setup. The OpenAPI contract, metrics, packaging, and Express/Nexla
+validation are still pending. Legacy API response formats are unchanged.
 
 ## Dependencies
 

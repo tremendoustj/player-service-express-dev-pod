@@ -107,6 +107,46 @@ def expected_rankings():
 
 
 @pytest.fixture
+def expected_comparisons():
+    def calculate(records):
+        numeric_columns = (
+            "birthYear", "birthMonth", "birthDay", "deathYear", "deathMonth", "deathDay",
+            "height", "weight",
+        )
+        players = [
+            {
+                column: (
+                    float(value)
+                    if column in numeric_columns and value is not None
+                    else value
+                )
+                for column, value in record.items()
+            }
+            for record in records
+        ]
+        differences = []
+        for left_index, left in enumerate(players):
+            for right in players[left_index + 1 :]:
+                differences.append(
+                    {
+                        "left_player_id": left["playerId"],
+                        "right_player_id": right["playerId"],
+                        "numeric": {
+                            field: (
+                                None
+                                if left[field] is None or right[field] is None
+                                else left[field] - right[field]
+                            )
+                            for field in ("birthYear", "height", "weight")
+                        },
+                    }
+                )
+        return {"data": players, "differences": differences}
+
+    return calculate
+
+
+@pytest.fixture
 def player_records():
     records = [
         {

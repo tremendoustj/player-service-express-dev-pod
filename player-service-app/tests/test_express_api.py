@@ -19,7 +19,11 @@ DETAIL_ROUTE = PLAYERS_URL + "/<string:player_id>"
 STATISTICS_URL = API_PREFIX + "/statistics"
 RANKINGS_URL = API_PREFIX + "/rankings"
 HEIGHT_RANKINGS_URL = RANKINGS_URL + "?metric=height"
-READ_URLS = [PLAYERS_URL, DETAIL_URL, STATISTICS_URL, HEIGHT_RANKINGS_URL]
+COMPARISONS_URL = API_PREFIX + "/comparisons"
+PAIR_COMPARISONS_URL = COMPARISONS_URL + "?player_ids=aaronha01,aaronto01"
+READ_URLS = [
+    PLAYERS_URL, DETAIL_URL, STATISTICS_URL, HEIGHT_RANKINGS_URL, PAIR_COMPARISONS_URL,
+]
 
 
 @pytest.fixture(autouse=True)
@@ -46,7 +50,7 @@ def assert_error(response, status, code):
 @pytest.mark.parametrize(
     "path",
     [
-        API_PREFIX, PLAYERS_URL, DETAIL_URL, STATISTICS_URL, RANKINGS_URL,
+        API_PREFIX, PLAYERS_URL, DETAIL_URL, STATISTICS_URL, RANKINGS_URL, COMPARISONS_URL,
         PLAYERS_URL + "/bad-id", API_PREFIX + "/unknown",
     ],
 )
@@ -520,6 +524,7 @@ def test_statistics_empty_database_is_a_successful_empty_population(
         "offset=0",
         "metric=height",
         "direction=asc",
+        "player_ids=aaronha01,aaronto01",
         "&".join("q=a" for _ in range(8)),
     ],
 )
@@ -533,7 +538,8 @@ def test_invalid_statistics_arguments_fail_before_any_database_access(
 
 
 @pytest.mark.parametrize(
-    "query", ["group_limit=1", "metric=height", "direction=asc"]
+    "query",
+    ["group_limit=1", "metric=height", "direction=asc", "player_ids=aaronha01,aaronto01"],
 )
 def test_search_does_not_accept_analytics_parameters(
     express_client, express_headers, tracked_connections, query
@@ -820,6 +826,284 @@ def test_invalid_ranking_arguments_fail_before_any_database_access(
     assert tracked_connections == []
 
 
+@pytest.mark.parametrize("indexes", [[1, 0], [0, 1], [3, 0, 1]])
+def test_comparisons_preserve_full_records_order_and_null_differences(
+    express_client, express_headers, player_records, expected_comparisons, indexes
+):
+    selected = [player_records[index] for index in indexes]
+    response = express_client.get(
+        COMPARISONS_URL,
+        query_string={"player_ids": ",".join(row["playerId"] for row in selected)},
+        headers={**express_headers, "X-Request-ID": "comparison-123"},
+    )
+
+    assert response.status_code == 200
+    assert response.is_json
+    assert response.get_json() == {
+        **expected_comparisons(selected),
+        "request_id": "comparison-123",
+    }
+    assert response.headers["X-Request-ID"] == "comparison-123"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5])
+def test_comparisons_accept_exact_cardinality_and_case_sensitive_id_bounds(
+    express_client, express_headers, player_db, player_records, expected_comparisons, count
+):
+    player_ids = ["a", "A", "9", "Ab09" * 8, "z"][:count]
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.executemany(
+            "INSERT INTO players (playerId) VALUES (?)",
+            [(player_id,) for player_id in reversed(player_ids)],
+        )
+        conn.commit()
+    expected_records = [
+        {**dict.fromkeys(player_records[0]), "playerId": player_id}
+        for player_id in player_ids
+    ]
+
+    response = express_client.get(
+        COMPARISONS_URL,
+        query_string={"player_ids": ",".join(player_ids)},
+        headers=express_headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {
+        **expected_comparisons(expected_records),
+        "request_id": response.headers["X-Request-ID"],
+    }
+    assert len(payload["data"]) == count
+    assert len(payload["differences"]) == count * (count - 1) // 2
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "player_ids=%61aronha01%2Caaronto01",
+        "%70layer_ids=aaronha01,aaronto01",
+        "player_ids=aaronha01%2caaronto01",
+    ],
+)
+def test_comparisons_accept_percent_encoded_names_ids_and_commas(
+    express_client, express_headers, player_records, expected_comparisons, query
+):
+    response = express_client.get(COMPARISONS_URL + "?" + query, headers=express_headers)
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_comparisons(player_records[:2]),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "player_ids",
+        "player_ids=",
+        "player_ids=aaronha01",
+        "player_ids=a,b,c,d,e,f",
+        "player_ids=" + ",".join(f"p{index}" for index in range(100)),
+        "player_ids=aaronha01,aaronha01",
+        "player_ids=aaronha01,aaronto01,aaronha01",
+        "player_ids=aaronha01,%61aronha01",
+        "player_ids=missing,missing",
+        "player_ids=,aaronha01",
+        "player_ids=aaronha01,",
+        "player_ids=aaronha01,,aaronto01",
+        "player_ids=aaronha01;aaronto01",
+        "player_ids=aaronha01|aaronto01",
+        "player_ids=aaronha01+aaronto01",
+        "player_ids=aaronha01,aaronto01&",
+        "&player_ids=aaronha01,aaronto01",
+        "player_ids=aaronha01,aaronto01&player_ids=aaronha01,aaronto01",
+        "player_ids=aaronha01,aaronto01&%70layer_ids=aaronha01,aaronto01",
+        "player_ids[]=aaronha01,aaronto01",
+        "PLAYER_IDS=aaronha01,aaronto01",
+        'player_ids=["aaronha01","aaronto01"]',
+        "player_ids=aaronha01," + "a" * 33,
+        "player_ids=aaronha01,%20",
+        "player_ids=aaronha01,%20aaronto01",
+        "player_ids=aaronha01,aaronto01%20",
+        "player_ids=aaronha01,aaronto01%0A",
+        "player_ids=aaronha01,a%00b",
+        "player_ids=aaronha01,a%09b",
+        "player_ids=aaronha01,a_b",
+        "player_ids=aaronha01,a-b",
+        "player_ids=aaronha01,a%2Fb",
+        "player_ids=aaronha01,quote%2701",
+        "player_ids=aaronha01,%C3%A9",
+        "player_ids=aaronha01,%EF%BC%A1",
+        "player_ids=aaronha01,%D9%A1",
+        "player_ids=aaronha01,%",
+        "player_ids=aaronha01,%GG",
+        "player_ids=aaronha01,%FF",
+        "player_ids=aaronha01,%C0%AF",
+        "player_ids=aaronha01,%ED%A0%80",
+        "player_ids=aaronha01,%2561aronto01",
+        "player_ids=aaronha01%252Caaronto01",
+        "player_ids=aaronha01,aaronto01%26limit%3D1",
+        "player_ids=aaronha01,aaronto01%27%20OR%201%3D1%20--",
+    ],
+)
+def test_invalid_comparison_arguments_fail_before_any_database_access(
+    express_client, express_headers, tracked_connections, query
+):
+    response = express_client.get(COMPARISONS_URL + "?" + query, headers=express_headers)
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "q=Aaron", "birth_country=USA", "birth_year_min=1900", "birth_year_max=2000",
+        "bats=R", "throws=R", "limit=2", "offset=0", "metric=height",
+        "direction=desc", "group_limit=1", "sql=SELECT+*+FROM+players", "unknown=secret",
+    ],
+)
+def test_comparisons_reject_filters_pagination_and_unknown_parameters(
+    express_client, express_headers, tracked_connections, extra
+):
+    response = express_client.get(
+        PAIR_COMPARISONS_URL + "&" + extra, headers=express_headers
+    )
+
+    assert_error(response, 400, "invalid_request")
+    assert tracked_connections == []
+
+
+@pytest.mark.parametrize(
+    "player_ids",
+    [
+        ["aaronha01", "missing"],
+        ["absent2", "aaronha01", "absent1"],
+        ["absent2", "absent1"],
+        ["Aaronha01", "aaronto01"],
+    ],
+)
+def test_missing_comparison_players_return_a_redacted_404_not_partial_records(
+    express_client, express_headers, player_ids, caplog
+):
+    response = express_client.get(
+        COMPARISONS_URL,
+        query_string={"player_ids": ",".join(player_ids)},
+        headers={**express_headers, "X-Request-ID": "comparison-404"},
+    )
+
+    assert_error(response, 404, "player_not_found")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["operation"] == "express_integration.compare_players"
+    assert event["route"] == COMPARISONS_URL
+    assert event["status"] == 404
+    assert event["request_id"] == "comparison-404"
+    assert event["error_code"] == "player_not_found"
+    assert event["exception_type"] == "PlayersNotFoundError"
+    assert event["result_count"] == 0
+    assert caplog.records[-1].exc_info is None
+    for player_id in player_ids:
+        assert player_id not in response.get_json()["error"]["message"]
+        assert player_id not in caplog.text
+
+
+def test_comparisons_of_an_empty_database_are_missing_not_empty_successes(
+    express_client, express_headers, player_db
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.commit()
+
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert_error(response, 404, "player_not_found")
+
+
+@pytest.mark.parametrize("count", [2, 5])
+@pytest.mark.parametrize("duplicates", [False, True])
+def test_comparisons_use_one_bounded_parameterized_read_with_duplicate_detection(
+    express_client, express_headers, player_db, monkeypatch, caplog, count, duplicates
+):
+    player_ids = [f"p{index}" for index in range(count)]
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute("DELETE FROM players")
+        conn.executemany(
+            "INSERT INTO players (playerId) VALUES (?)",
+            [(player_id,) for player_id in player_ids]
+            + ([(player_ids[-1],)] * 100 if duplicates else []),
+        )
+        conn.commit()
+    queries = []
+    fetchall = PlayerService._fetchall
+
+    def track_query(self, query, parameters=()):
+        rows = fetchall(self, query, parameters)
+        if query.startswith("SELECT * FROM players"):
+            queries.append((query, parameters, len(rows)))
+        return rows
+
+    monkeypatch.setattr(PlayerService, "_fetchall", track_query)
+    response = express_client.get(
+        COMPARISONS_URL,
+        query_string={"player_ids": ",".join(player_ids)},
+        headers=express_headers,
+    )
+
+    assert len(queries) == 1
+    query, parameters, row_count = queries[0]
+    assert query.endswith("LIMIT ?")
+    assert all(player_id not in query for player_id in player_ids)
+    assert parameters == (*player_ids, count + 1)
+    assert row_count == count + int(duplicates)
+    if duplicates:
+        assert_error(response, 503, "storage_unavailable")
+        event = json.loads(caplog.records[-1].getMessage())
+        assert event["exception_type"] == "DataError"
+        assert event["result_count"] == 0
+        assert all(player_id not in caplog.text for player_id in player_ids)
+    else:
+        assert response.status_code == 200
+        assert [row["playerId"] for row in response.get_json()["data"]] == player_ids
+
+
+@pytest.mark.parametrize("field", ["birthYear", "height", "weight"])
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        (None, 2.5, None),
+        (2.5, None, None),
+        (None, None, None),
+        (0, 0, 0.0),
+        (0, 2.5, -2.5),
+        (-1.5, 2.5, -4.0),
+        (2.5, -1.5, 4.0),
+        (1e308, 1e308, 0.0),
+    ],
+)
+def test_comparison_differences_preserve_nulls_zeros_and_finite_values(
+    express_client, express_headers, player_db, field, left, right, expected
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.executemany(
+            f"UPDATE players SET {field} = ? WHERE playerId = ?",
+            [(left, "aaronha01"), (right, "aaronto01")],
+        )
+        conn.commit()
+
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert [row[field] for row in payload["data"]] == [left, right]
+    assert payload["differences"][0]["numeric"][field] == expected
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -884,7 +1168,9 @@ def test_invalid_inputs_fail_before_any_database_read(
         (MAX_QUERY_STRING_BYTES + 1, 414, "request_too_large"),
     ],
 )
-@pytest.mark.parametrize("url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL, RANKINGS_URL])
+@pytest.mark.parametrize(
+    "url", [PLAYERS_URL, DETAIL_URL, STATISTICS_URL, RANKINGS_URL, COMPARISONS_URL]
+)
 def test_exact_query_string_size_boundary(
     express_client, express_headers, tracked_connections, size, status, code, url
 ):
@@ -1010,6 +1296,9 @@ def test_unsafe_request_ids_are_replaced(
         (RANKINGS_URL, "POST", 405, "method_not_allowed"),
         (RANKINGS_URL, "DELETE", 405, "method_not_allowed"),
         (RANKINGS_URL + "/", "GET", 404, "not_found"),
+        (COMPARISONS_URL, "POST", 405, "method_not_allowed"),
+        (COMPARISONS_URL, "DELETE", 405, "method_not_allowed"),
+        (COMPARISONS_URL + "/", "GET", 404, "not_found"),
     ],
 )
 def test_routing_errors_are_correlated_and_do_not_query(
@@ -1085,6 +1374,10 @@ def test_http_reads_use_configured_deadlines(
             RANKINGS_URL, "rank_players",
             {"metric": "height", "q": "sensitive-search"}, RANKINGS_URL,
         ),
+        (
+            COMPARISONS_URL, "compare_players",
+            {"player_ids": "sensitiveplayer,otherplayer"}, COMPARISONS_URL,
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1121,7 +1414,8 @@ def test_safe_error_mapping_and_redacted_failure_logs(
     assert event["route"] == route
     assert caplog.records[-1].exc_info is None
     for sensitive in (
-        express_token, "sensitive-search", "sensitiveplayer", "private", "Authorization"
+        express_token, "sensitive-search", "sensitiveplayer", "otherplayer",
+        "private", "Authorization",
     ):
         assert sensitive not in caplog.text
         assert sensitive not in response.get_data(as_text=True)
@@ -1181,7 +1475,13 @@ def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
             if query in (
                 "SELECT COUNT(*) FROM players",
                 "SELECT * FROM players WHERE playerId COLLATE BINARY = ? LIMIT ?",
-            ) or query.startswith(("SELECT COUNT(*) AS total,", "SELECT COUNT(*), COUNT(")):
+            ) or query.startswith(
+                (
+                    "SELECT COUNT(*) AS total,",
+                    "SELECT COUNT(*), COUNT(",
+                    "SELECT * FROM players WHERE playerId COLLATE BINARY IN (",
+                )
+            ):
                 query = (
                     "WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL "
                     "SELECT i + 1 FROM n WHERE i < 10000000) SELECT SUM(i) FROM n"
@@ -1202,19 +1502,24 @@ def test_real_query_cancellation_is_504_and_subsequent_reads_succeed(
 
 
 @pytest.mark.parametrize(
-    ("path", "query", "operation", "route"),
+    ("path", "query", "operation", "route", "result_count"),
     [
-        (PLAYERS_URL, {"q": "Hank"}, "search_players", PLAYERS_URL),
-        (DETAIL_URL, None, "get_player", DETAIL_ROUTE),
-        (STATISTICS_URL, {"q": "Hank"}, "get_player_statistics", STATISTICS_URL),
+        (PLAYERS_URL, {"q": "Hank"}, "search_players", PLAYERS_URL, 1),
+        (DETAIL_URL, None, "get_player", DETAIL_ROUTE, 1),
+        (STATISTICS_URL, {"q": "Hank"}, "get_player_statistics", STATISTICS_URL, 1),
         (
             RANKINGS_URL, {"metric": "height", "q": "Hank"},
-            "rank_players", RANKINGS_URL,
+            "rank_players", RANKINGS_URL, 1,
+        ),
+        (
+            COMPARISONS_URL, {"player_ids": "aaronha01,aaronto01"},
+            "compare_players", COMPARISONS_URL, 2,
         ),
     ],
 )
 def test_success_logs_are_structured_without_player_or_query_data(
-    express_client, express_headers, express_token, caplog, path, query, operation, route
+    express_client, express_headers, express_token, caplog,
+    path, query, operation, route, result_count
 ):
     caplog.set_level(logging.INFO)
     response = express_client.get(
@@ -1226,13 +1531,13 @@ def test_success_logs_are_structured_without_player_or_query_data(
     assert event["operation"] == "express_integration." + operation
     assert event["route"] == route
     assert event["status"] == 200
-    assert event["result_count"] == 1
+    assert event["result_count"] == result_count
     assert event["error_code"] is None
     assert event["exception_type"] is None
     assert event["duration_ms"] >= 0
     assert event["timestamp"].endswith("+00:00")
     assert event["request_id"] == response.get_json()["request_id"]
-    for sensitive in ("Hank", "aaronha01", express_token, "Authorization"):
+    for sensitive in ("Hank", "aaronha01", "aaronto01", express_token, "Authorization"):
         assert sensitive not in caplog.text
 
 
@@ -1414,6 +1719,120 @@ def test_ranking_page_failure_never_returns_partial_metadata(
     assert event["result_count"] == 0
     assert "private ranking" not in caplog.text
     assert "private ranking" not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize("field", ["birthYear", "height", "weight"])
+@pytest.mark.parametrize("value", [float("inf"), -float("inf"), "private", b"private"])
+@pytest.mark.parametrize("other_value", [None, 1.0])
+def test_invalid_comparison_values_fail_even_when_the_counterpart_is_null(
+    express_client, express_headers, player_db, caplog, field, value, other_value
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.executemany(
+            f"UPDATE players SET {field} = ? WHERE playerId = ?",
+            [(other_value, "aaronha01"), (value, "aaronto01")],
+        )
+        conn.commit()
+
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    for sensitive in ("Infinity", "private", "aaronha01", "aaronto01"):
+        assert sensitive not in response.get_data(as_text=True)
+        assert sensitive not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["birthYear", "height", "weight"])
+@pytest.mark.parametrize("left", [1e308, -1e308])
+def test_overflowing_comparison_differences_fail_despite_finite_operands(
+    express_client, express_headers, player_db, caplog, field, left
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.executemany(
+            f"UPDATE players SET {field} = ? WHERE playerId = ?",
+            [(left, "aaronha01"), (-left, "aaronto01")],
+        )
+        conn.commit()
+
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    assert "Infinity" not in response.get_data(as_text=True)
+
+
+def test_invalid_records_and_duplicates_outside_comparison_do_not_block_results(
+    express_client, express_headers, player_db, player_records, expected_comparisons
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            "UPDATE players SET height = ? WHERE playerId = ?", ("invalid", "unknown01")
+        )
+        conn.execute(
+            "INSERT INTO players SELECT * FROM players WHERE playerId = ?", ("unknown01",)
+        )
+        conn.commit()
+
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **expected_comparisons(player_records[:2]),
+        "request_id": response.headers["X-Request-ID"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"), [("nameGiven", b"private-record"), ("birthMonth", float("inf"))]
+)
+def test_unserializable_comparison_fields_never_return_partial_results(
+    express_client, express_headers, player_db, caplog, field, value
+):
+    with closing(sqlite3.connect(player_db)) as conn:
+        conn.execute(
+            f"UPDATE players SET {field} = ? WHERE playerId = ?", (value, "aaronha01")
+        )
+        conn.commit()
+
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "DataError"
+    assert event["result_count"] == 0
+    for sensitive in ("private-record", "Infinity"):
+        assert sensitive not in caplog.text
+        assert sensitive not in response.get_data(as_text=True)
+
+
+def test_comparison_query_failure_never_returns_partial_results(
+    express_client, express_headers, monkeypatch, caplog
+):
+    connect = sqlite3.connect
+
+    class FailingComparisonConnection(sqlite3.Connection):
+        def execute(self, query, parameters=()):
+            if query.startswith("SELECT * FROM players WHERE playerId COLLATE BINARY IN ("):
+                raise sqlite3.OperationalError("private comparison query diagnostic")
+            return super().execute(query, parameters)
+
+    def failing_connect(*args, **kwargs):
+        return connect(*args, factory=FailingComparisonConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", failing_connect)
+    response = express_client.get(PAIR_COMPARISONS_URL, headers=express_headers)
+
+    assert_error(response, 503, "storage_unavailable")
+    event = json.loads(caplog.records[-1].getMessage())
+    assert event["exception_type"] == "OperationalError"
+    assert event["result_count"] == 0
+    assert "private comparison" not in caplog.text
+    assert "private comparison" not in response.get_data(as_text=True)
 
 
 def test_complete_seed_pagination_through_authenticated_http(
@@ -1629,6 +2048,37 @@ def test_filtered_seed_rankings_match_independent_csv_population(
     assert [row["weight"] for row in payload["data"]] == [
         float(row["weight"]) for row in expected["data"]
     ]
+
+
+def test_seed_comparisons_match_independent_csv_records_and_differences(
+    express_client, express_headers, seed_player_records, expected_comparisons
+):
+    assert len(seed_player_records) == 19370
+    selected = [seed_player_records[-1], seed_player_records[0]]
+    for field in ("birthYear", "height", "weight"):
+        selected.append(
+            next(
+                row
+                for row in seed_player_records
+                if row[field] is None
+                and row["playerId"] not in {record["playerId"] for record in selected}
+            )
+        )
+
+    response = express_client.get(
+        COMPARISONS_URL,
+        query_string={"player_ids": ",".join(row["playerId"] for row in selected)},
+        headers=express_headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {
+        **expected_comparisons(selected),
+        "request_id": response.headers["X-Request-ID"],
+    }
+    assert len(payload["data"]) == 5
+    assert len(payload["differences"]) == 10
 
 
 def test_legacy_player_routes_stay_unauthenticated_and_unchanged(
